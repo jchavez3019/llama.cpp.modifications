@@ -1,6 +1,6 @@
 # Phase 1 results: measurements and block prototype
 
-Status: in progress. The block benchmark, the fit, and the BUG-001 PR tests are done. The server telemetry is still open. The plan is [phase_1_measurements.md](phase_1_measurements.md).
+Status: all work items are done. Closing the phase waits on the laptop PCIe link question (see "Open questions"). The plan is [phase_1_measurements.md](phase_1_measurements.md).
 
 ## Summary
 
@@ -62,7 +62,7 @@ The size per token decides how much a tier can hold.
 | LFM2 | about 165 KB fixed (recurrent state) plus 12 KB per token | about 1.0 GB/s | about 5.8 GB/s |
 | Gemma | 26.7 KB per token up to the SWA window, then only the global layers grow | about 1.0 GB/s | about 5.1 GB/s |
 
-The laptop copies at about 1 GB/s, far below PCIe 4.0 x8 (about 13 GB/s). The state calls copy each layer's tensors through pageable host memory, so this is a software limit, not a hardware one.
+The laptop copies at about 1 GB/s because its PCIe link ran at Gen 1 x8 during all Phase 1 runs, even at 100% GPU load (`nvidia-smi`: current Gen 1, max Gen 4, no replays). Gen 1 x8 carries at most about 2 GB/s. Phase 0's swaps imply about 2.7 GB/s, so the link was faster then. The laptop copy costs here are upper bounds. A faster link only lowers \(t_\text{copy}\) and \(T\), so the conclusions do not change. Pageable host memory and per-layer copies may also limit the rate, but that can only be measured on a Gen 4 link.
 
 ### Block size (Llama only)
 
@@ -100,11 +100,30 @@ The ideal hit rates are 41.6% for the background task, and 85.7% / 89.2% / 56.4%
 - **Why #28992 does not fix BUG-002.** It asks the RAM cache for a better start (`has_better`) even when `update_cache` is false. But with similarity 0 and pinned stages, nothing ever saves a state to the RAM cache (0 RAM restores), so there is never a better entry to find. A fix must also save the outgoing state, as BUGS.md proposes.
 - **The PRs differ in scope.** #30866 is one line and covers only the empty pinned slot. #28992 also covers a pinned slot that holds a shorter prefix than a cached entry, which config E does not exercise.
 
-All runs in this session were about 45% slower than Phase 0, the stock control included (turn p50 2.6 s against 1.8 s, swap 625 ms per turn against 128 ms). The GPU had no throttle reason. The laptop was plugged in, with the "balanced" power profile. Phase 0 did not record the power profile, so the cause is not confirmed. The three binaries compare fairly with each other; their times do not compare with Phase 0.
+All runs in this session were about 45% slower than Phase 0, the stock control included (turn p50 2.6 s against 1.8 s, swap 625 ms per turn against 128 ms). The GPU had no throttle reason. The likely cause is the PCIe link at Gen 1 (see "State size and copy rate"): the swap alone grew by about 500 ms per turn. The three binaries compare fairly with each other; their times do not compare with Phase 0.
 
 ### Cache telemetry
 
-Not done yet.
+The server now logs, at info level, one line per RAM cache save and one line per prompt start, in `tools/server/server-context.cpp` (fork only):
+
+```
+prompt cache save: 636 tokens, 19.883 MiB, 21.94 ms
+prompt cache use: src = ram, reused = 532, prefill = 89, load = 19.54 ms, 19.883 MiB
+```
+
+`src` is `ram` when the slot state was restored from the RAM cache for this prompt, `slot` when the slot's own cells were reused, and `none` otherwise. `reused` is the final `n_past`, after checkpoints and the "evaluate at least 1 token" rule. A restore is detected by the cache losing an entry, because `server_prompt_cache::load` returns true also when no entry is better. `summary.py` adds the columns "Save ms/turn", "Load ms/turn", and "Src ram/slot/none".
+
+Rerun of configs A and E, laptop, Llama, 3 reps (stock code plus telemetry; `bench-results/phase1/telemetry/`):
+
+| Config | Swap ms/turn | Save ms/turn | Load ms/turn | Src ram / slot / none | Server save rate | Server load rate |
+| --- | --- | --- | --- | --- | --- | --- |
+| A | 642 | 362 | 279 | 64 / 4 / 1 | 0.72 GB/s | 0.88 GB/s |
+| E | 605 | 383 | 279 | 62 / 4 / 15 | 0.72 GB/s | 0.88 GB/s |
+
+- **`reused` matches the client.** In every turn of config A, it equals the `cache_n` the client received.
+- **BUG-001 is visible directly.** Config E has 15 prompts with `src = none`: the pinned background requests on an empty slot. Config A has 1, the first prompt.
+- **Saves cost more than loads.** In config A, a turn saves 266 MiB (the outgoing state of every stage) and loads 253 MiB. Saves are 56-63% of the swap time.
+- **The server copies at the same rate as the block benchmark,** so the benchmark's \(t_\text{copy}\) applies to the server.
 
 ## Insights
 
@@ -113,22 +132,22 @@ What the numbers change in the design.
 | Finding | Consequence | Phase |
 | --- | --- | --- |
 | \(T\) is below 16 tokens everywhere, and 0 on the phone | The restore rule and run-based pruning almost never trigger. Keep them, but tier capacity and eviction matter far more | 2 |
-| Phase 0's slow laptop swap (131 ms per turn) is mostly whole-state size, at about 1 GB/s | Restoring only the shared prefix, not the whole prompt, is what makes RAM restores cheap | 2 |
+| A swap moves whole states: 266 MiB saved and 253 MiB loaded per turn in config A | Store shared prefixes once and skip saves of states the tree already holds | 2 |
 | Block restores cost 3-23% more than one whole restore at `B` 64-256 on the laptop | Per-call overhead is small enough that a "load many blocks" library call is not needed yet | 2 |
 | Block save at `B` 16 costs 2x (laptop) to 6.5x (phone) a whole save | Saves should happen off the request path, or use a larger `B` for saves | 2 |
 | On the phone, recomputing an unfilled last block costs seconds per restore | Store a leaf's last partial block too, so nothing is recomputed. Then `B` is set by copy cost only, and 64-256 is better | 2 |
-| The laptop copy rate is a software limit | Pinned host memory or one copy per tensor could give a large speed-up. That is a library change, so it goes on the upstream track only with numbers | upstream |
+| The laptop PCIe link ran at Gen 1 during Phase 1 | Laptop copy costs are upper bounds. Every laptop run should log the PCIe generation, and the Phase 2 reruns should use a Gen 4 link | all |
 | Both upstream PRs fix BUG-001; neither fixes BUG-002 | Phase 2 and 3 runs can use either PR as the stock baseline for config E. BUG-002 stays open | 2, 3 |
 | Throttling slows prefill by 20% to 11x | Every laptop run starts from a cool GPU and logs its state (`run_laptop.sh`) | all |
 
 ## Changes to later phases
 
 - [phase_2_ram_tree.md](phase_2_ram_tree.md) should save a leaf's last partial block, and start with `B` = 64 on both devices, then confirm it with the Phase 2 matrix.
-- [design.md](../design.md), "Restore or recompute": replace the 10-100 token estimate with the measured \(T\). This is not done yet; it waits until the BUG-001 tests and telemetry close Phase 1.
+- [design.md](../design.md), "Restore or recompute": replace the 10-100 token estimate with the measured \(T\). This is not done yet; it waits for the Gen 4 rerun of the laptop numbers.
 
 ## Open questions
 
 - The phone runs were not checked for throttling. The phone values are comparable with Phase 0, which was measured the same way, but they are not peak values.
 - Block storage for Gemma (SWA) and LFM2 (recurrent) is not tested. SWA masking relative to the scratch sequence, and recurrent state that cannot be split by position, are Phase 4 questions.
-- Why were all laptop orchestration runs on Nov 9 about 45% slower than Phase 0? Check the power profile ("balanced" against "performance") before the Phase 2 reruns, and record it in `meta.json`.
-- Pinned host memory for tier 1: how much of the 13 GB/s bus can the laptop reach, and what does it cost in RAM that cannot be swapped?
+- Why does the laptop's PCIe link stay at Gen 1 under load since the Nov 9 reboot? Candidates: the "balanced" power profile, PCIe power management, or the driver's power state. Once the link reaches Gen 4, rerun the Llama block benchmark and configs A and E to replace the laptop copy costs.
+- Pinned host memory for tier 1: on a Gen 4 link, how much of the bus can the state calls reach, and what does pinned RAM cost?

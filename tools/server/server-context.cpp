@@ -340,10 +340,25 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // last prompt_load() of this slot, reported and reset when the next prompt starts
+    bool    cache_loaded     = false;
+    double  cache_load_ms    = 0.0;
+    size_t  cache_load_bytes = 0;
+
+    /**
+     * @brief Copies the slot KV state to a new entry of the RAM prompt cache.
+     *
+     * Logs the saved tokens, size, and time at info level.
+     *
+     * @param prompt_cache The RAM prompt cache.
+     * @return True if the state was saved. False if the slot is empty, the cache refused the entry, or the copy failed.
+     */
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
+
+        const int64_t t_start = ggml_time_us();
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
@@ -366,14 +381,35 @@ struct server_slot {
             return false;
         }
 
+        SLT_INF(*this, "prompt cache save: %d tokens, %.3f MiB, %.2f ms\n",
+                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
+
         return true;
     }
 
+    /**
+     * @brief Replaces the slot KV state with the best matching RAM cache entry for `tokens`, if one is better than the current state.
+     *
+     * Records in cache_loaded, cache_load_ms, and cache_load_bytes whether an entry was restored, so the next prompt can report it.
+     *
+     * @param prompt_cache The RAM prompt cache. A restored entry is removed from it.
+     * @param tokens The tokens of the new prompt.
+     * @return False if an entry was found but could not be restored. True otherwise, including when no entry was better.
+     */
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        const size_t  n_states_before = prompt_cache.states.size();
+        const size_t  size_before     = prompt_cache.size();
+        const int64_t t_start         = ggml_time_us();
+
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
+
+        // load() erases the restored entry, and it never adds one
+        cache_loaded     = res && prompt_cache.states.size() < n_states_before;
+        cache_load_ms    = cache_loaded ? (ggml_time_us() - t_start) / 1000.0 : 0.0;
+        cache_load_bytes = cache_loaded ? size_before - prompt_cache.size() : 0;
 
         return res;
     }
@@ -4369,6 +4405,14 @@ private:
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
+
+                        SLT_INF(slot, "prompt cache use: src = %s, reused = %d, prefill = %d, load = %.2f ms, %.3f MiB\n",
+                                slot.cache_loaded ? "ram" : (n_past > 0 ? "slot" : "none"), n_past, slot.task->n_tokens() - n_past,
+                                slot.cache_load_ms, slot.cache_load_bytes / (1024.0 * 1024.0));
+
+                        slot.cache_loaded     = false;
+                        slot.cache_load_ms    = 0.0;
+                        slot.cache_load_bytes = 0;
 
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;

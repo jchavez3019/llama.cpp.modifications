@@ -112,6 +112,24 @@ def test_log_summary_counts_cache_events_and_sums_update_time() -> None:
     m = summarize_log(log)
     assert m["log.ram_restore"] == 2 and m["log.ram_evict"] == 1 and m["log.empty_skip"] == 1 and m["log.purge"] == 1 and m["log.full_reprocess"] == 0
     assert m["log.cache_update_ms"] == 3.5
+    assert "log.load_ms" not in m and "log.src_ram" not in m
+
+
+def test_log_summary_reads_telemetry_saves_loads_and_sources() -> None:
+    """
+    Given: a server log with two RAM cache saves and three prompt starts, one restored from RAM, one reused from the slot, and one cold.
+    When: the log is summarized.
+    Then: save and load times and sizes are summed, and each source is counted once.
+    """
+    log = ("slot prompt_save: id  0 | task 3 | prompt cache save: 1200 tokens, 37.500 MiB, 12.50 ms\n"
+           "slot prompt_save: id  1 | task 4 | prompt cache save: 300 tokens, 9.375 MiB, 3.00 ms\n"
+           "slot update_slot: id  0 | task 5 | prompt cache use: src = ram, reused = 1100, prefill = 89, load = 10.25 ms, 37.500 MiB\n"
+           "slot update_slot: id  1 | task 6 | prompt cache use: src = slot, reused = 700, prefill = 89, load = 0.00 ms, 0.000 MiB\n"
+           "slot update_slot: id  0 | task 7 | prompt cache use: src = none, reused = 0, prefill = 1035, load = 0.00 ms, 0.000 MiB\n")
+    m = summarize_log(log)
+    assert m["log.save_ms"] == 15.5 and m["log.save_mib"] == 46.875
+    assert m["log.load_ms"] == 10.25 and m["log.load_mib"] == 37.5
+    assert (m["log.src_ram"], m["log.src_slot"], m["log.src_none"]) == (1, 1, 1)
 
 
 def test_hal_temperatures_ignore_cached_section_and_cooling_devices() -> None:

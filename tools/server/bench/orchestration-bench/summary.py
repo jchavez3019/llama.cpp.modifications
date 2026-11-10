@@ -50,6 +50,11 @@ LOG_EVENTS_: dict[str, str] = {
 }
 _CACHE_UPDATE_RE = re.compile(r"prompt cache update took ([\d.]+) ms")
 
+# Fork telemetry lines (info level): one per RAM cache save, and one per prompt start.
+_CACHE_SAVE_RE = re.compile(r"prompt cache save: (\d+) tokens, ([\d.]+) MiB, ([\d.]+) ms")
+_CACHE_USE_RE = re.compile(r"prompt cache use: src = (\w+), reused = (\d+), prefill = (\d+), load = ([\d.]+) ms, ([\d.]+) MiB")
+CACHE_SOURCES_: tuple[str, ...] = ("ram", "slot", "none")
+
 
 def quantile(values: list[float], q: float) -> float:
     """Returns the ``q`` quantile with linear interpolation, or NaN for an empty list."""
@@ -155,10 +160,21 @@ def summarize_log(log_text: str) -> Metrics:
     """Counts cache events in a server log and sums the prompt cache update time.
 
     :param log_text: Server log written with ``-lv 4``.
-    :return: ``log.<event>`` counts and ``log.cache_update_ms``.
+    :return: ``log.<event>`` counts and ``log.cache_update_ms``. When the log has fork telemetry lines, also ``log.save_ms``, ``log.save_mib``, ``log.load_ms``, ``log.load_mib``, and ``log.src_<source>`` prompt counts.
     """
     out: Metrics = {f"log.{name}": float(log_text.count(pattern)) for name, pattern in LOG_EVENTS_.items()}
     out["log.cache_update_ms"] = sum(float(m.group(1)) for m in _CACHE_UPDATE_RE.finditer(log_text))
+
+    # Telemetry metrics exist only for logs that have the lines, so older runs show "-" instead of 0.
+    uses = _CACHE_USE_RE.findall(log_text)
+    if uses:
+        saves = _CACHE_SAVE_RE.findall(log_text)
+        out["log.save_ms"] = sum(float(ms) for _, _, ms in saves)
+        out["log.save_mib"] = sum(float(mib) for _, mib, _ in saves)
+        out["log.load_ms"] = sum(float(u[3]) for u in uses)
+        out["log.load_mib"] = sum(float(u[4]) for u in uses)
+        for src in CACHE_SOURCES_:
+            out[f"log.src_{src}"] = float(sum(1 for u in uses if u[0] == src))
     return out
 
 
@@ -200,7 +216,11 @@ def summarize_rep(run_dir: Path, rep: str) -> Metrics:
     log_path = output_path(prefix, ".server.log")
     if log_path.exists():
         out.update(summarize_log(log_path.read_text(encoding="utf-8", errors="replace")))
-        out["log.cache_update_ms_per_turn"] = _ratio(out["log.cache_update_ms"], len({r.turn for r in records}))
+        n_all_turns = len({r.turn for r in records})
+        out["log.cache_update_ms_per_turn"] = _ratio(out["log.cache_update_ms"], n_all_turns)
+        for key in ("save_ms", "load_ms"):
+            if f"log.{key}" in out:
+                out[f"log.{key}_per_turn"] = _ratio(out[f"log.{key}"], n_all_turns)
     return out
 
 
@@ -229,7 +249,7 @@ def markdown(root: Path) -> str:
 
     stage_cols = ["Device", "Model", "Config", "Stage", "Hit %", "Ideal %", "Prefill tok", "TTFT p50 ms", "TTFT p95 ms"]
     turn_cols = ["Device", "Model", "Config", "Reps", "Turn p50 ms", "Turn p95 ms", "Peak RSS MiB", "Peak VRAM MiB", "Peak BIG C", "Big MHz", "J/turn", "CPU J/turn",
-                 "Swap ms/turn", "RAM restores", "RAM evictions", "Empty-slot skips", "Purges", "Full reprocess", "Errors"]
+                 "Swap ms/turn", "Save ms/turn", "Load ms/turn", "Src ram/slot/none", "RAM restores", "RAM evictions", "Empty-slot skips", "Purges", "Full reprocess", "Errors"]
     stage_tbl = [_row(stage_cols), _row(["---"] * len(stage_cols))]
     turn_tbl = [_row(turn_cols), _row(["---"] * len(turn_cols))]
     for device, model, config, n_reps, m in rows:
@@ -240,7 +260,8 @@ def markdown(root: Path) -> str:
         turn_tbl.append(_row([
             device, model, config, str(n_reps), _fmt(m, "turn_p50"), _fmt(m, "turn_p95"), _fmt(m, "peak_rss_mib"), _fmt(m, "peak_vram_mib"),
             _fmt(m, "peak_temp_big", digits=1), _fmt(m, "mean_big_freq_mhz"), _fmt(m, "energy_j_per_turn", digits=1), _fmt(m, "cpu_energy_j_per_turn", digits=1),
-            _fmt(m, "log.cache_update_ms_per_turn"), _fmt(m, "log.ram_restore"), _fmt(m, "log.ram_evict"), _fmt(m, "log.empty_skip"), _fmt(m, "log.purge"),
+            _fmt(m, "log.cache_update_ms_per_turn"), _fmt(m, "log.save_ms_per_turn", digits=1), _fmt(m, "log.load_ms_per_turn", digits=1),
+            "/".join(_fmt(m, f"log.src_{src}") for src in CACHE_SOURCES_), _fmt(m, "log.ram_restore"), _fmt(m, "log.ram_evict"), _fmt(m, "log.empty_skip"), _fmt(m, "log.purge"),
             _fmt(m, "log.full_reprocess"), _fmt(m, "n_errors"),
         ]))
     return "\n".join(stage_tbl) + "\n\n" + "\n".join(turn_tbl) + "\n"
