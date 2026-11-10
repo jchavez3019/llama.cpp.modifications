@@ -22,7 +22,7 @@ New files `tools/server/server-prompt-tree.h` and `server-prompt-tree.cpp`, next
 | Element | Content |
 | --- | --- |
 | Node | Token run `[p0, p1)` and its tokens; children keyed by first token; list of block references; hit count with aging, last use, priority; reference count |
-| Block | `B` tokens of K/V at positions `[k*B, (k+1)*B)`, saved with the Phase 1 method; owned by the node whose run contains the block's last token |
+| Block | `B` tokens of K/V at positions `[k*B, (k+1)*B)`, saved with the Phase 1 method; owned by the node whose run contains the block's last token. A leaf also keeps a short last block for its tokens after the last full block, freed once a child covers it |
 | Tree | Root, total bytes, byte limit (`--cache-ram`), block size `B`, restore threshold \(T_1\) |
 
 Operations, all on the index only (no llama calls), so they can be unit tested:
@@ -36,7 +36,7 @@ Operations that move data, in the same file, using a scratch sequence ID:
 
 ### 2. Server integration
 
-- **Flag:** `--cache-tree` (off by default) uses the tree in place of `server_prompt_cache`, with the same `--cache-ram` limit. `--cache-tree-block N` sets `B`, and `--cache-tree-min-restore N` sets \(T_1\) (defaults from Phase 1).
+- **Flag:** `--cache-tree` (off by default) uses the tree in place of `server_prompt_cache`, with the same `--cache-ram` limit. `--cache-tree-block N` sets `B` (default 64), and `--cache-tree-min-restore N` sets \(T_1\) (default 0, from Phase 1).
 - **Scratch sequence:** context creation uses `n_seq_max = n_parallel + 1`; the last ID is the scratch sequence. Requires `--kv-unified`.
 - **Save point:** where `prompt_save` runs today (`get_available_slot` before a slot is reused, and idle-slot caching), call `insert` with the slot's tokens and save only blocks the tree does not have. A prefix already in the tree costs nothing to save again.
 - **Load point:** where `prompt_load` runs today, compare the slot's own common prefix (tier 0) with the tree match. If the tree gives more than \(T_1\) extra tokens, `seq_rm` the slot from the block-aligned slot prefix, then `restore` the tree's blocks up to the match. The slot's `prompt.tokens` is set to the restored tokens, and `update_slots()` prefills the rest as today.
@@ -68,5 +68,5 @@ Report: hit rate per stage, TTFT, turn time, energy (phone), RAM used by the tre
 
 ## Risks
 
-- **Per-block call overhead.** If Phase 1 shows it is large, add "load a list of blocks" as a library call first (a small, separate change).
+- **Per-block call overhead.** Phase 1 measured about 0.10 ms per block restore and 0.42 ms per block save on both devices. The tree is built first with `B` 64 and the existing calls. Then, as a later Phase 2 step, add a library call that saves and loads a list of blocks with one copy per layer, and switch the default to `B` 16 if it brings block costs close to one whole-state copy.
 - **Positions.** Blocks store absolute positions; a restore is only valid at the same positions. Context shift and `--cache-reuse` must be off with `--cache-tree` until Phase 3 adds copy-on-write.

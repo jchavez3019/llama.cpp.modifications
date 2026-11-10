@@ -210,10 +210,10 @@ Y  [10,..)                          [ p2' (8-11)   ] ...      path P2, once save
 ```
 
 - **The split touches no stored data.** X1 takes p0 and p1, and X2 takes p2 and p3. Only piece references move.
-- **A piece that crosses a node boundary belongs to the child.** p2 holds tokens 8-9 (shared) and 10-11 (P1 only). Its K/V for tokens 10-11 depend on P1, so it belongs to X2. When Y is saved, it gets its own p2' with P2's tokens 10-11, so tokens 8-9 are stored twice. Each branch stores at most `B - 1` tokens again: at `B = 16` and 32 KiB per token, that is at most 480 KiB.
+- **A piece that crosses a node boundary belongs to the child.** p2 holds tokens 8-9 (shared) and 10-11 (P1 only). Its K/V for tokens 10-11 depend on P1, so it belongs to X2. When Y is saved, it gets its own p2' with P2's tokens 10-11, so tokens 8-9 are stored twice. "Blocks at a branch point" below shows how this grows with more children.
 - **Restoring X1 alone** loads p0 and p1 (8 tokens), then either recomputes tokens 8-9 or loads p2 and trims tokens 10-11. Either way the extra work is below `B` tokens, whatever the length of X.
 
-**Choosing `B`.** If `B` is at most \(T_t\), recomputing the boundary tokens is always cheap and the trim path is not needed. On the laptop (\(T_1\) about 10-95 tokens), `B = 16` fits. On the phone, prefill is 6.5-22 ms per token, so recomputing 15 tokens costs 0.1-0.3 s, and a small `B` or the trim path is better.
+**Choosing `B`.** Phase 1 measured \(T\) at about 1 token on the laptop and 0 on the phone, so restoring is almost always better than recomputing, and a leaf's short last block is worth keeping on both devices. Duplicates at branch points stay small at any practical `B` (see "Blocks at a branch point" below), so memory does not decide `B`. The per-call overhead does: about 0.10 ms per restore call and 0.42 ms per save call, so at `B = 16` a save costs 5.7x one whole-state copy (see [phase_1_measurements_results.md](roadplan/phase_1_measurements_results.md)). Phase 2 starts with `B = 64` and the existing library calls, and moves to `B = 16` if a batched block call removes the per-call overhead.
 
 **Sequence IDs are a tier-0 limit only.** The 256-ID limit (`LLAMA_MAX_SEQ`) applies to cells in the KV pool. Blocks in tiers 1 and 2 are plain bytes with no sequence IDs, so the storage choice does not touch the limit. A restore writes blocks into cells under one sequence ID, the same as any tier-0 node.
 
@@ -222,6 +222,55 @@ Y  [10,..)                          [ p2' (8-11)   ] ...      path P2, once save
 **Why option 3.** It keeps exact reuse in tier 0, where splits are free, and bounds the waste of every restore to `B - 1` tokens without an API that loads part of a saved blob. The cost is a list of block references per node and up to `B - 1` duplicate tokens per branch. Option 2 is close, but it rounds splits in tier 0 too and forces anchors onto block boundaries. Option 1 stays a fallback if a cheap partial-load API turns out to exist.
 
 **What it needs from the library.** A call that saves the K/V of positions `[k * B, (k + 1) * B)` of a sequence into a buffer, and a call that loads a list of blocks into cells under one sequence ID in one call. One call per run, not per block, keeps the fixed restore overhead from growing with the number of blocks.
+
+### Blocks at a branch point
+
+This example follows one node from leaf to branch point, to show which blocks exist at each step and where tokens are stored twice. `B = 4`. A system prompt S has 10 tokens (positions 0-9), and the stages A, B, and C, then a new request D, each continue it at position 10.
+
+**Step 1: S is a leaf.** S stores two full blocks and a short last block for tokens 8-9. A short block holds only its own tokens, so it uses the memory of 2 tokens, not 4.
+
+```
+position   0  1  2  3 | 4  5  6  7 | 8  9
+S          [s  s  s  s]|[s  s  s  s]|[s  s]        2 full blocks + short block (8-9)
+```
+
+**Step 2: A is saved.** A's first block covers positions 8-11. Tokens 10-11 are A's own, so the block belongs to A, and it also holds S's tokens 8-9. S's short block is now redundant and is freed.
+
+```
+position   0  1  2  3 | 4  5  6  7 | 8  9 10 11 | 12 13 14 15
+S          [s  s  s  s]|[s  s  s  s]                             short block freed
+A                                  [s  s  a  a]|[a  a  a  a] ...
+```
+
+**Step 3: B and C are saved.** Each gets its own block at positions 8-11, because its tokens 10-11 differ. S's tokens 8-9 are now stored three times, once per child.
+
+```
+position   0  1  2  3 | 4  5  6  7 | 8  9 10 11 | 12 13 14 15
+S          [s  s  s  s]|[s  s  s  s]
+A                                  [s  s  a  a]|[a  a  a  a] ...
+B                                  [s  s  b  b]|[b  b  b  b] ...
+C                                  [s  s  c  c]|[c  c  c  c] ...
+```
+
+**Step 4: D arrives.** D matches S and diverges at position 10. To restore S, load S's two blocks, then the block at positions 8-11 of any child (A, B, or C, since all three hold tokens 8-9), then remove positions 10-11 with `seq_rm`. D prefills from position 10, and once it is saved, it adds its own block at positions 8-11.
+
+**How many tokens are stored twice.** Let `p` be the position where the children start (here 10). The tokens of S after its last full block are positions `B * floor(p / B)` to `p - 1`, so there are `r = p mod B` of them (here 10 mod 4 = 2: tokens 8 and 9).
+- Every child's first block starts at `B * floor(p / B)`, so every child stores those `r` tokens.
+- With `k` children there are `k` copies. One copy is needed, so `(k - 1) * r` tokens are duplicates. Here: (3 - 1) x 2 = 4 tokens.
+- With one child there is no duplicate, because S's short block is freed.
+- If `p` is a multiple of `B`, then `r = 0`: no block crosses the boundary and nothing is stored twice.
+
+**The average of `r`.** `r` is between 0 and `B - 1`. If branch positions fall anywhere relative to block boundaries, each value is equally likely, so the average is \((0 + 1 + \dots + (B-1)) / B = (B-1)/2\). This is an assumption, not a measurement. A fixed system prompt always branches at the same position, so its `r` is one fixed value: a 1,500-token prompt with `B = 64` has `r = 1500 mod 64 = 28` for every branch.
+
+For Llama 3.2 1B (32 KiB per token), the duplicate per extra child is:
+
+| `B` | Average (\(r = (B-1)/2\)) | Worst case (\(r = B - 1\)) |
+| --- | --- | --- |
+| 16 | 0.23 MiB | 0.47 MiB |
+| 64 | 0.98 MiB | 1.97 MiB |
+| 256 | 3.98 MiB | 7.97 MiB |
+
+**When the last child is evicted,** S becomes a leaf again without its short block, so restoring S recomputes its last `r` tokens (fewer than `B`). A later version could keep them by loading the child's first block into a scratch sequence, trimming it, and saving it as S's short block before the child is freed.
 
 ## Request flow
 
@@ -266,11 +315,11 @@ t_\text{overhead}(t) + k \cdot t_\text{copy}(t) < k \cdot t_\text{prefill}
 
 The step that divides by \(t_\text{prefill} - t_\text{copy}(t)\) assumes copying a token is cheaper than computing it. If it is not, restoring never pays off, and the tier is useless for restores.
 
-On the laptop with Llama 3.2 1B, \(t_\text{prefill}\) is about 0.11 ms (1 / 9,300 tokens/s). One token's K/V is 2 x 16 layers x 8 KV heads x 64 dims x 2 bytes = 32 KiB, so \(t_\text{copy}(1)\) is about 3 us at about 12 GB/s. Then \(T_1 \approx t_\text{overhead}(1) / 0.107\ \text{ms}\): an overhead of 1 ms gives \(T_1 \approx 10\) tokens, and 10 ms gives \(T_1 \approx 95\) tokens. So \(T_1\) depends almost entirely on the fixed cost of a restore call, not on bandwidth, and that fixed cost depends on the implementation. Today's whole-state path copies through pageable memory and is slow. A range copy into pinned memory would lower \(T_1\) a lot. On the phone, \(t_\text{prefill}\) is 6.5-22 ms per token, so \(T_2\) (flash) is a few tokens at most.
+Phase 1 measured these terms with `llama-kv-block-bench` (see [phase_1_measurements_results.md](roadplan/phase_1_measurements_results.md)). On the laptop with Llama 3.2 1B, \(t_\text{prefill}\) is 0.126 ms per token, \(t_\text{overhead}(1)\) is 0.105 ms per call, and \(t_\text{copy}(1)\) is 0.0044 ms per token (32 KiB per token at about 8 GB/s over PCIe Gen 4). That gives \(T_1 = 0.105 / (0.126 - 0.0044) \approx 0.9\) tokens. LFM2 also gives about 1 token, and Gemma less than 16. On the phone, prefill is 15-28 ms per token and a restore copies RAM to RAM at 5-7 GB/s, so \(T\) is 0. So a restore pays off for almost any run, and the threshold matters only for a slower tier such as flash. The earlier estimate of 10-100 tokens assumed a fixed cost of 1-10 ms per call; the measured cost is about 0.1 ms.
 
 The linear model is a first approximation. Two effects make it conservative, so it restores slightly less often than optimal: prefill per token grows with position, because attention covers more context, and a small prefill batch uses the GPU less efficiently than the `llama-bench` rate assumes.
 
-Examples with the path above and \(T_1 = 100\):
+Examples with the path above and \(T_1 = 100\), a value large enough to show both outcomes (the measured \(T_1\) is about 1, so in practice both runs are restored):
 
 | Request matches | Tier-1 run | Decision |
 | --- | --- | --- |
@@ -470,8 +519,8 @@ This needs a laptop baseline against SGLang with HiCache, and a stage-ordering p
 
 ## Open questions
 
-- **Block size `B`.** Per device or per model? The laptop can use 16 or more; the phone may need a smaller `B`, because recomputing boundary tokens there costs 6.5-22 ms each.
-- **Block state API.** Can the existing per-layer state writer save one block by position, or does tier 1 need its own block format (for example one contiguous buffer per block with all layers)?
+- **Block size `B`.** Partly answered by Phase 1: with short last blocks kept, the per-call overhead decides `B`, not recompute cost or memory. Phase 2 starts at 64; whether 16 is better depends on a batched block call.
+- **Block state API.** Answered by Phase 1: the existing writer saves one block by position (tag the block's cells with a scratch sequence, then save that sequence), and restores give identical logits. Open: a batched call that saves or loads many blocks with one copy per layer.
 - **Relation to #30970.** Can the tree be built on top of `--slot-attach`, or does slot-attach's slot-owned model conflict with tree ownership?
 - **Gemma on the phone.** Phase 0 measured a 51% stage-3 hit for Gemma in config C on the phone but 0% on the laptop. The cause is not verified yet, and it affects how SWA snapshots should be placed.
 - **Energy as a cost.** On the phone, should the restore rule weigh energy as well as time? Phase 0 shows energy tracks prefill tokens closely.

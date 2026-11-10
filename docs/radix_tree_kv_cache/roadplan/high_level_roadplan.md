@@ -9,7 +9,7 @@ The order puts measurements first, then the tree over RAM, then sharing in the K
 | Phase | Name | Plan | Results | Status |
 | --- | --- | --- | --- | --- |
 | 0 | Baseline | [plan](phase_0_baseline.md) | [results](phase_0_baseline_results.md) | done |
-| 1 | Measurements and block prototype | [plan](phase_1_measurements.md) | [results](phase_1_measurements_results.md) | in progress |
+| 1 | Measurements and block prototype | [plan](phase_1_measurements.md) | [results](phase_1_measurements_results.md) | done |
 | 2 | Tree over RAM with block storage | [plan](phase_2_ram_tree.md) | [results](phase_2_ram_tree_results.md) | planned |
 | 3 | Parked sequences and stateless slots | [plan](phase_3_parked_sequences.md) | [results](phase_3_parked_sequences_results.md) | planned |
 | 4 | Anchors and snapshot policy | [plan](phase_4_anchors_snapshots.md) | [results](phase_4_anchors_snapshots_results.md) | planned |
