@@ -73,12 +73,28 @@ Server, A-tree, median of 3 reps:
 
 Hit rates are the same in all runs. The turn time differences are within run-to-run noise.
 
+### Restore only the missing part
+
+The slot keeps its full blocks of the match, and the tree restores only the blocks after them. Results are in `bench-results/phase2-shared-nokeep/` and `bench-results/phase2-shared-keep/`.
+
+The test workload adds a system prompt part that all requests share at the start: presets `desktop-shared` (1,024 tokens, laptop) and `edge-shared` (768 tokens, phone). In A, the slot then holds the shared part of the last stage, and keeps 16 blocks (laptop) or 12 blocks (phone) of each restore. A-tree, median of 3 reps:
+
+| Device | Restore | Load ms/turn | Blocks loaded per restore | TTFT stage 1 / 2 / 3 | Turn p50 |
+| --- | --- | --- | --- | --- | --- |
+| laptop | from position 0 | 54.2 | 25-30 | 104 / 35 / 561 ms | 1765 ms |
+| laptop | keep the slot's blocks | 35.5 | 9-14 | 96 / 28 / 555 ms | 1738 ms |
+| phone | from position 0 | 24.0 | 18-19 | 1.13 / 1.15 / 14.0 s | 22.0 s |
+| phone | keep the slot's blocks | 12.1 | 6-7 | 1.33 / 1.36 / 16.8 s | 25.7 s |
+
+Hit rates are the same with and without the change. The phone ran the two configs one after the other without cooling, and its turn time rose in every rep (21.1, 22.0, 23.5, then 24.3, 25.7, 26.6 s), so only its load time is a valid comparison. `check_tree_keep` (restore into a sequence that holds another prompt with the same first block) is bit-identical on both devices.
+
 ## Insights
 
 What the numbers alone do not say.
 
 - **Restoring is cheap, recomputing is not.** On the phone the F-tree turn is 20.1 s against 45.3 s for F, with the same restores that A pays for. The tree turns F into A without a second slot.
-- **A restore is not free on the laptop.** A-tree's stage 1 TTFT is 105 ms against C's 19 ms: C reuses the slot's own cells, A-tree copies them back from RAM. Restoring only the part the slot does not already hold would close most of this gap (see "Changes to later phases").
+- **A restore is not free on the laptop.** A-tree's stage 1 TTFT is 105 ms against C's 19 ms: C reuses the slot's own cells, A-tree copies them back from RAM. In A the slot always holds another stage's prompt and shares only the 25-token template header with the new one, so keeping the slot's blocks does not help here, and only parked sequences (Phase 3) can close this gap.
+- **Keeping the slot's blocks pays off with a shared system prompt.** Many requests with one shared prompt part and more conversations than slots is the common case for agents and multi-user servers. There, a restore keeps the shared part and copies only the rest: 35% less load time on the laptop and 50% less on the phone. In a chat that only grows on its own slot, the slot already holds everything the tree has, so the tree does not restore at all.
 - **The tree grows without a token cap.** On the laptop (the default `--cache-ram` of 8,192 MiB), the tree reaches 2.7 GiB and 94 nodes. Most of it is one-off stage 3 tails that are never matched again. The stock cache has a token cap (n_ctx, 16,384), which holds about 4 prompts.
 - **Config D is a capacity limit, not a tree problem.** One stage 3 state is larger than D's limit (117-149 MiB on the laptop against 128 MiB). A save that large would evict every other prompt and then itself, so the tree skips it. Storing shared prefixes once does not make it fit.
 - **Per-block call overhead was the save cost.** Before batching, the laptop saved 119 MiB per turn at 1.33 GiB/s, against about 4 GB/s for one whole-state save. Profiling showed one device copy per layer per block (32 per block) and an allocation per block. The batched call reads every block in one `ggml_backend_tensor_get_n_ptr` call.
@@ -92,7 +108,6 @@ What the numbers alone do not say.
 
 Plan or design changes that follow from these results.
 
-- **Restore only the missing part.** `tree_load` clears the slot and restores from position 0 even when the slot already holds a block-aligned prefix of the match. Keeping that prefix and restoring only the rest is a small server change and saves copies on both devices. Added as the next Phase 2 step.
 - **`B` stays 64.** The block size decision in [phase_2_ram_tree.md](phase_2_ram_tree.md) ("Risks") is closed: saves are batched, restores are not, and `B` 16 no longer saves recompute.
 - **Phase 3 (parked sequences)** is the way to make restores free: a prefix that stays in KV cells is restored by a metadata-only `seq_cp`. This matters more than faster copies, on both devices.
 - **Eviction needs a priority for one-off tails** before the tree runs without a byte limit. A token cap like the stock cache's is the simple option.
@@ -104,5 +119,6 @@ Questions this phase raised and did not answer.
 - Does F-tree really diverge from the no-cache run more often than C (13 vs 10 of 24), or is that noise? More requests would settle it.
 - Phone D-tree is 5 s faster than D with the same hit rates. Thermal state differed between the runs (no cooling waits), so this may not be real.
 - Partial saves for prompts larger than the limit (config D stage 3) need an eviction policy that does not thrash.
-- Does a block pool pay off for larger models, where the save cost per turn grows with the K/V size?
+- Does a block pool pay off for larger models? Only the 1B model was measured. With grouped-query attention, K/V size grows more slowly than compute (Llama 3.1 8B has 4x the K/V per token and about 8x the compute), so the save share of a turn is expected to be smaller, not larger.
+- Hybrid setups, where a request runs on the device or on a server with the same tree: requests share system prompts on both sides, and a server with many nodes also needs prefix-aware routing, so a request goes to the node that holds its prefix. Related work keeps shared prefixes in GPU memory (vLLM automatic prefix caching, SGLang RadixAttention), which is closer to Phase 3.
 - Would batched restores help with many small blocks on other backends (Metal, Vulkan) where per-call cost differs?

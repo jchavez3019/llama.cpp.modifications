@@ -120,17 +120,18 @@ struct server_prompt_tree {
     bool save_blocks(llama_context * ctx, llama_seq_id seq_id, const std::vector<server_prompt_block *> & blocks);
 
     /**
-     * @brief Restores the positions [0, m.n_restore) of a match into a sequence.
+     * @brief Restores the positions [0, m.n_restore) of a match into a sequence, and keeps the positions [0, p_keep) that the sequence already holds.
      *
-     * Each block is loaded into `seq_scratch` and then moved to `seq_id`. Positions of the last block past n_restore are removed.
+     * Positions of `seq_id` from p_keep are removed first. Then each block from p_keep is loaded into `seq_scratch` and moved to `seq_id`. Positions of the last block past n_restore are removed.
      *
      * @param ctx The context that holds the sequence.
-     * @param seq_id An empty sequence that receives the K/V.
+     * @param seq_id The sequence that receives the K/V. Its positions [0, p_keep) must hold the same tokens as the match.
      * @param seq_scratch An empty sequence, used only for the copy.
      * @param m A match returned by match(), with no insert() or evict() in between.
-     * @return The number of positions restored. On failure the sequence is cleared and the return value is 0.
+     * @param p_keep A multiple of the block size, less than m.n_restore.
+     * @return m.n_restore. If p_keep is not valid, nothing changes and the return value is 0. If a load fails, the sequence is cleared and the return value is 0.
      */
-    int32_t restore(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_scratch, const server_prompt_tree_match & m);
+    int32_t restore(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_scratch, const server_prompt_tree_match & m, llama_pos p_keep = 0);
 
     size_t n_bytes() const { return n_bytes_total; }
     size_t n_nodes() const;

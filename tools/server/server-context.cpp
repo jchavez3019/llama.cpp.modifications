@@ -1917,7 +1917,7 @@ private:
     /**
      * @brief Replaces the slot K/V with the prompt tree's prefix of `tokens`, if the tree has more than --cache-tree-min-restore extra tokens.
      *
-     * Saves the slot to the tree first, so its K/V are not lost. Records the restore in cache_loaded, cache_from_tree, cache_load_ms, and cache_load_bytes. Counts a hit on the matched path in all cases, so the tree clock advances once per request.
+     * Saves the slot to the tree first, so its K/V are not lost. The slot keeps its full blocks of the match, and only the blocks after them are loaded. Records the restore in cache_loaded, cache_from_tree, cache_load_ms, and cache_load_bytes. Counts a hit on the matched path in all cases, so the tree clock advances once per request.
      *
      * @param slot An idle slot.
      * @param tokens The tokens of the new prompt.
@@ -1941,25 +1941,36 @@ private:
             return;
         }
 
-        slot.prompt_clear();
-        const int32_t n_restored = prompt_tree->restore(ctx_tgt, slot.id, prompt_tree_seq, m);
+        // the slot keeps its full blocks of the match, the tree restores the rest
+        // a sampled token that was never decoded has no K/V, so count only the slot's cells
+        const int32_t n_block = params_base.cache_tree_block;
+        const int32_t n_cells = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1;
+        const int32_t n_keep  = std::min({ n_slot, n_cells, m.n_restore - 1 }) / n_block * n_block;
+
+        const int32_t n_restored = prompt_tree->restore(ctx_tgt, slot.id, prompt_tree_seq, m, n_keep);
         if (n_restored == 0) {
             SLT_WRN(slot, "%s", "failed to restore the prompt from the prompt tree\n");
+            slot.prompt_clear();
             return;
         }
+        slot.prompt.clear();
         slot.prompt.tokens = server_tokens(llama_tokens(prompt.begin(), prompt.begin() + n_restored), false);
 
         size_t n_bytes = 0;
+        int32_t n_loaded = 0;
         for (const server_prompt_block * b : m.blocks) {
-            n_bytes += b->data.size();
+            if (b->pos0 >= n_keep) {
+                n_bytes += b->data.size();
+                ++n_loaded;
+            }
         }
         slot.cache_loaded     = true;
         slot.cache_from_tree  = true;
         slot.cache_load_ms    = (ggml_time_us() - t_start) / 1000.0;
         slot.cache_load_bytes = n_bytes;
 
-        SLT_INF(slot, "prompt tree restore: %d tokens (slot had %d), %zu blocks, %.3f MiB, %.2f ms\n",
-                n_restored, n_slot, m.blocks.size(), n_bytes / (1024.0 * 1024.0), slot.cache_load_ms);
+        SLT_INF(slot, "prompt tree restore: %d tokens (slot had %d, kept %d), %d blocks, %.3f MiB, %.2f ms\n",
+                n_restored, n_slot, n_keep, n_loaded, n_bytes / (1024.0 * 1024.0), slot.cache_load_ms);
     }
 
     server_slot * get_available_slot(const server_task & task) {

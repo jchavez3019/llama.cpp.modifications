@@ -77,6 +77,24 @@ def test_stage_system_prompts_stay_static_while_user_message_changes() -> None:
     assert [r.max_tokens for r in t0] == [PRESETS["edge"].gen_router, PRESETS["edge"].gen_extractor, PRESETS["edge"].gen_synthesis]
 
 
+def test_shared_preset_starts_every_system_prompt_with_the_same_part() -> None:
+    """
+    Given: the edge-shared preset and the edge preset with the same seed.
+    When: the stage and background requests of a turn are built.
+    Then: every system prompt starts with the same shared text of sys_shared tokens, ends with the edge preset's own system prompt, and the edge preset has no shared part.
+    """
+    shared = Workload(PRESETS["edge-shared"], seed=7, layout=Layout.INLINE, count_tokens=fake_count)
+    plain = make_workload()
+    reqs_shared = shared.stage_requests(0) + [shared.background_request(0)]
+    reqs_plain = plain.stage_requests(0) + [plain.background_request(0)]
+
+    prefix = calibrated_text(7, "sys/shared", PRESETS["edge-shared"].sys_shared, fake_count) + "\n"
+    assert fake_count(prefix) == PRESETS["edge-shared"].sys_shared
+    for a, b in zip(reqs_shared, reqs_plain):
+        assert a.messages[0]["content"] == prefix + b.messages[0]["content"]
+        assert not b.messages[0]["content"].startswith(prefix)
+
+
 def test_turns_layout_sends_previous_turns_as_chat_messages() -> None:
     """
     Given: a turns-layout workload.

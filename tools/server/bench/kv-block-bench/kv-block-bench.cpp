@@ -430,11 +430,13 @@ static bool decode_chunked(bench_ctx & bc, const std::vector<llama_token> & toke
     return true;
 }
 
-/** @brief Restore the cached prefix of `prompt[0, n)` from the tree, probe position n, and compare with `ref`. */
-static void check_tree_case(bench_ctx & bc, server_prompt_tree & tree, const std::vector<llama_token> & prompt, int32_t n, int32_t b, const std::vector<float> & ref, const char * kind) {
-    llama_memory_clear(bc.mem, true);
+/** @brief Restore the cached prefix of `prompt[0, n)` from the tree on top of the first p_keep positions that SEQ_MAIN holds, probe position n, and compare with `ref`. */
+static void check_tree_case(bench_ctx & bc, server_prompt_tree & tree, const std::vector<llama_token> & prompt, int32_t n, int32_t b, const std::vector<float> & ref, const char * kind, llama_pos p_keep = 0) {
+    if (p_keep == 0) {
+        llama_memory_clear(bc.mem, true);
+    }
     const server_prompt_tree_match m = tree.match(llama_tokens(prompt.begin(), prompt.begin() + n));
-    const int32_t n_restored = tree.restore(bc.ctx, SEQ_MAIN, SEQ_SCRATCH, m);
+    const int32_t n_restored = tree.restore(bc.ctx, SEQ_MAIN, SEQ_SCRATCH, m, p_keep);
     llama_synchronize(bc.ctx);
 
     std::vector<float> cur;
@@ -457,6 +459,7 @@ static void check_tree_case(bench_ctx & bc, server_prompt_tree & tree, const std
  * - branch: all of prompt 2, which ends in a short block
  * - split:  all of prompt 1, whose node was split by prompt 2
  * - inside: the first p - 1 tokens, whose last block belongs to a child
+ * - keep:   all of prompt 2 into a sequence that holds prompt 1, keeping its first block
  */
 static bool check_tree(bench_ctx & bc, const std::vector<llama_token> & tokens, int32_t b) {
     const int32_t n1 = 4 * b;
@@ -501,6 +504,13 @@ static bool check_tree(bench_ctx & bc, const std::vector<llama_token> & tokens, 
     check_tree_case(bc, tree, prompt2, n2,    b, ref2,       "check_tree_branch");
     check_tree_case(bc, tree, prompt1, n1,    b, ref1,       "check_tree_split");
     check_tree_case(bc, tree, prompt1, p - 1, b, ref_inside, "check_tree_inside");
+
+    // a slot that holds prompt 1 keeps its first block, which prompt 2 shares, and gets the rest of prompt 2 from the tree
+    llama_memory_clear(bc.mem, true);
+    if (!decode_chunked(bc, prompt1, n1, b)) {
+        return false;
+    }
+    check_tree_case(bc, tree, prompt2, n2, b, ref2, "check_tree_keep", b);
     return true;
 }
 

@@ -78,6 +78,7 @@ class Preset:
     :param gen_extractor: Generated tokens of stage 2.
     :param gen_synthesis: Generated tokens of stage 3.
     :param gen_background: Generated tokens of the background task.
+    :param sys_shared: Tokens of a system prompt part that all requests share at the start (for example, common tool definitions). Zero for none.
     """
 
     sys_router: int
@@ -93,6 +94,7 @@ class Preset:
     gen_extractor: int
     gen_synthesis: int
     gen_background: int
+    sys_shared: int = 0
 
     def max_tokens(self, stage: Stage) -> int:
         """Returns the number of tokens to generate for a stage."""
@@ -110,10 +112,22 @@ PRESETS: dict[str, Preset] = {
         sys_background=400, background_input=600,
         gen_router=16, gen_extractor=48, gen_synthesis=128, gen_background=64,
     ),
+    "desktop-shared": Preset(
+        sys_router=500, sys_extractor=700, sys_synthesis=500, rag=3000, meta=50, query=30, history_answer=300,
+        sys_background=400, background_input=600,
+        gen_router=16, gen_extractor=48, gen_synthesis=128, gen_background=64,
+        sys_shared=1024,
+    ),
     "edge": Preset(
         sys_router=300, sys_extractor=400, sys_synthesis=300, rag=600, meta=30, query=20, history_answer=80,
         sys_background=250, background_input=250,
         gen_router=8, gen_extractor=24, gen_synthesis=48, gen_background=32,
+    ),
+    "edge-shared": Preset(
+        sys_router=300, sys_extractor=400, sys_synthesis=300, rag=600, meta=30, query=20, history_answer=80,
+        sys_background=250, background_input=250,
+        gen_router=8, gen_extractor=24, gen_synthesis=48, gen_background=32,
+        sys_shared=768,
     ),
 }
 
@@ -221,6 +235,18 @@ class Workload:
             self._cache[name] = calibrated_text(self.seed, name, n_tokens, self._count)
         return self._cache[name]
 
+    def system(self, name: str, n_tokens: int) -> str:
+        """Returns a system prompt: the shared part (if the preset has one), then the request's own part.
+
+        :param name: Segment name of the request's own part.
+        :param n_tokens: Tokens of the request's own part.
+        :return: The system prompt text.
+        """
+        own = self._text(name, n_tokens)
+        if self.preset.sys_shared <= 0:
+            return own
+        return f"{self._text('sys/shared', self.preset.sys_shared)}\n{own}"
+
     def query(self, turn: int) -> str:
         """Returns the user query of a turn."""
         return self._text(f"query/{turn}", self.preset.query)
@@ -253,17 +279,17 @@ class Workload:
         dynamic = f"metadata: {meta}\nuser query: {query}"
 
         router: list[ChatMessage] = [
-            {"role": "system", "content": self._text("sys/router", p.sys_router)},
+            {"role": "system", "content": self.system("sys/router", p.sys_router)},
             {"role": "user", "content": dynamic},
         ]
         extractor: list[ChatMessage] = [
-            {"role": "system", "content": self._text("sys/extractor", p.sys_extractor)},
+            {"role": "system", "content": self.system("sys/extractor", p.sys_extractor)},
             {"role": "user", "content": dynamic},
         ]
 
         # Stage 3: system prompt, then the history, then the per-turn documents and query.
         documents = f"<documents>\n{self._text(f'rag/{turn}', p.rag)}\n</documents>\n{dynamic}"
-        synthesis: list[ChatMessage] = [{"role": "system", "content": self._text("sys/synthesis", p.sys_synthesis)}]
+        synthesis: list[ChatMessage] = [{"role": "system", "content": self.system("sys/synthesis", p.sys_synthesis)}]
         if self.layout == Layout.INLINE:
             synthesis.append({"role": "user", "content": f"<history>\n{self.history_text(turn)}</history>\n{documents}"})
         else:
@@ -286,7 +312,7 @@ class Workload:
         """
         p = self.preset
         messages: list[ChatMessage] = [
-            {"role": "system", "content": self._text("sys/background", p.sys_background)},
+            {"role": "system", "content": self.system("sys/background", p.sys_background)},
             {"role": "user", "content": self._text(f"notifications/{turn}", p.background_input)},
         ]
         return Request(turn, Stage.BACKGROUND, messages, p.max_tokens(Stage.BACKGROUND))

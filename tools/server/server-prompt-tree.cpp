@@ -236,15 +236,19 @@ bool server_prompt_tree::save_blocks(llama_context * ctx, llama_seq_id seq_id, c
     return true;
 }
 
-int32_t server_prompt_tree::restore(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_scratch, const server_prompt_tree_match & m) {
-    if (m.n_restore == 0) {
+int32_t server_prompt_tree::restore(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_scratch, const server_prompt_tree_match & m, llama_pos p_keep) {
+    if (p_keep < 0 || p_keep % n_block != 0 || p_keep >= m.n_restore) {
         return 0;
     }
 
     llama_memory_t mem = llama_get_memory(ctx);
+    llama_memory_seq_rm(mem, seq_id, p_keep, -1);
 
     // set_data() clears its target sequence, so each block goes through the scratch sequence
     for (const server_prompt_block * b : m.blocks) {
+        if (b->pos0 < p_keep) {
+            continue;
+        }
         if (llama_state_seq_set_data(ctx, b->data.data(), b->data.size(), seq_scratch) == 0) {
             llama_memory_seq_rm(mem, seq_scratch, -1, -1);
             llama_memory_seq_rm(mem, seq_id, -1, -1);

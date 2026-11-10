@@ -8,7 +8,7 @@ One turn runs three stages with different static system prompts: router, tool ex
 
 | File | Purpose |
 | --- | --- |
-| `workload.py` | Seeded prompt generator, calibrated to exact token counts with `/tokenize`. Presets `desktop` and `edge`, layouts `inline` and `turns`. |
+| `workload.py` | Seeded prompt generator, calibrated to exact token counts with `/tokenize`. Presets `desktop` and `edge`, and `desktop-shared` and `edge-shared` with a system prompt part shared by all requests. Layouts `inline` and `turns`. |
 | `runner.py` | Streaming client. Pinning modes, background thread, one JSON line per request, ideal reuse per request. |
 | `telemetry.py` | Local sampler (RSS from `/proc`, per-process VRAM, GPU power, utilization, and temperature with NVML via `pynvml`). Phone recorder (a Perfetto trace plus thermal polling with `dumpsys thermalservice`). |
 | `phone_trace.py` | Reads power-rail energy, server RSS, and big-core frequency of the measured window from a Perfetto trace. |
