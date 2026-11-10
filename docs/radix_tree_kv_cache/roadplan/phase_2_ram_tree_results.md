@@ -47,18 +47,26 @@ Results are in `bench-results/phase2/` (git-ignored).
 
 ### Batched block save
 
-Saving all new blocks of a slot with one library call instead of one call per block. Results are in `bench-results/phase2-batch/` (one shared buffer) and `bench-results/phase2-batch-direct/` (one buffer per block, the final version).
+Saving all new blocks of a slot with one library call instead of one call per block. The tree keeps each block in its own buffer, so it can free one block without touching the others. The three save methods differ in where the K/V goes on its way to those buffers:
 
-`kv-block-bench` with the first version (all blocks into one shared buffer that the bench reuses), median of 3 reps (laptop: 4,096 tokens; phone: 1,024 tokens):
+| Save method | Device reads | Copies of the data in RAM | New memory per save | CUDA gather kernel |
+| --- | --- | --- | --- | --- |
+| Per block | one call per block, 32 reads each | 1 | each block's buffer | no |
+| Batched, one shared buffer (first version) | one call for all blocks, into one temporary buffer | 2: the temporary buffer, then a copy out into each block's buffer | the temporary buffer and each block's buffer | yes, the destination is one compact range |
+| Batched, one buffer per block (final version) | one call for all blocks, each read straight into its block's buffer | 1 | each block's buffer | no, the block buffers are far apart in memory |
 
-| Device | Whole save | `B` 16, per block | `B` 16, batched | `B` 64, per block | `B` 64, batched | Whole restore | `B` 16 restore | `B` 64 restore |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| laptop | 33.1 ms | 135.2 ms | 45.4 ms | 51.4 ms | 41.1 ms | 16.0 ms | 47.6 ms | 27.0 ms |
-| phone | 4.0 ms | 23.7 ms | 8.7 ms | 7.6 ms | 6.8 ms | 4.1 ms | 10.2 ms | 6.2 ms |
+The first version was fast in the bench, which reused one warm temporary buffer, and slow in the server, where both the temporary buffer and the block buffers are new memory with page faults. The final version touches new memory once and skips the extra copy, but loses the gather kernel. Server results are in `bench-results/phase2-batch/` (one shared buffer) and `bench-results/phase2-batch-direct/` (one buffer per block). Bench results are in `bench-results/phase2-batch/` (one shared buffer) and `bench-results/phase2-final/` (one buffer per block).
 
-All `check_block_batch` and `check_tree_*` checks are bit-identical on both devices.
+`kv-block-bench`, median of 3 reps (laptop: 4,096 tokens; phone: 1,024 tokens). The "one shared buffer" rows reused a warm buffer, so they paid no page faults; they are kept for comparison only:
 
-The bench reused one warm buffer, so these numbers hide the cost of new memory. The bench now gets new memory for each save, as the server does. With new memory on the laptop at 4,096 tokens, a save is 157 ms per block and 140 ms batched at `B` 16, and 97 ms and 90 ms at `B` 64.
+| Device | Batched save | Whole save | `B` 16, per block | `B` 16, batched | `B` 64, per block | `B` 64, batched | Whole restore | `B` 16 restore | `B` 64 restore |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| laptop | one buffer per block, new memory | 31.3 ms | 150.0 ms | 137.3 ms | 93.5 ms | 88.9 ms | 16.9 ms | 43.7 ms | 26.6 ms |
+| laptop | one shared buffer, warm | 33.1 ms | 135.2 ms | 45.4 ms | 51.4 ms | 41.1 ms | 16.0 ms | 47.6 ms | 27.0 ms |
+| phone | one buffer per block, new memory | 5.2 ms | 37.2 ms | 30.7 ms | 29.2 ms | 26.2 ms | 4.8 ms | 12.7 ms | 7.1 ms |
+| phone | one shared buffer, warm | 4.0 ms | 23.7 ms | 8.7 ms | 7.6 ms | 6.8 ms | 4.1 ms | 10.2 ms | 6.2 ms |
+
+All `check_block_batch` and `check_tree_*` checks are bit-identical on both devices, with both batched saves. The whole save still reuses one warm buffer across reps, so it pays no page faults and is a lower bound, not a fair comparison with the block saves. With new memory, batching saves 5-10% (laptop) and 10-17% (phone) against per-block saves, and most of a block save is page faults: on the phone, 32 MiB of new blocks costs about 20 ms more than the warm buffer.
 
 Server, A-tree, median of 3 reps:
 
