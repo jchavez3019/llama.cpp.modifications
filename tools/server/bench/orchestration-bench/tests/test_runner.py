@@ -1,5 +1,6 @@
 import io
 import json
+import time
 
 import pytest
 
@@ -23,6 +24,19 @@ from workload import PRESETS, ChatMessage, Layout, Request, Stage, Workload
 def word_count(text: str) -> int:
     """Stand-in tokenizer: one token per word."""
     return len(text.split())
+
+
+def test_wait_ready_fails_at_once_when_the_server_process_has_exited() -> None:
+    """
+    Given: a client of a server whose process has exited, and a ready timeout of 900 s.
+    When: the client waits for the server to be ready.
+    Then: it raises RuntimeError at once, before any health request, instead of waiting for the timeout.
+    """
+    client = ServerClient("http://127.0.0.1:1")
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="exited before it was ready"):
+        client.wait_ready(900, lambda: False)
+    assert time.monotonic() - t0 < 1.0
 
 
 class FakeClient(ServerClient):

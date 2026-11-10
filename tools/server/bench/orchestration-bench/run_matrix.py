@@ -9,6 +9,8 @@ Configurations (all use ``--kv-unified``, ``-fa on``, ``-lv 4``):
     D  as A with a small --cache-ram (the eviction cliff)
     E  as A plus a concurrent background task on slot 1 every 2 turns
     F  as A with --cache-ram 0 (one slot, no RAM cache: each stage overwrites the cells of the one before)
+    A-tree, D-tree  as A and D with --cache-tree (Phase 2)
+    F-tree  as F with --cache-tree and the RAM cache size of A
 
 Examples:
     python run_matrix.py --target local --server-extra "-ngl 99" --models ~/models/*.gguf --device laptop
@@ -57,11 +59,13 @@ class Config:
     :param n_parallel: Number of server slots (``-np``).
     :param cache_ram_mib: ``--cache-ram`` value, or None for the server default (8192 MiB).
     :param run: Client settings. ``n_turns`` and ``n_warmup`` are replaced by the CLI values.
+    :param server_extra: Server arguments of this configuration only.
     """
 
     n_parallel: int
     cache_ram_mib: int | None
     run: RunConfig
+    server_extra: tuple[str, ...] = ()
 
 
 def configs(d_cache_ram_mib: int, default_cache_ram_mib: int | None) -> dict[str, Config]:
@@ -79,6 +83,9 @@ def configs(d_cache_ram_mib: int, default_cache_ram_mib: int | None) -> dict[str
         "D": Config(2, d_cache_ram_mib, base),
         "E": Config(2, default_cache_ram_mib, replace(base, bg_every=_BG_EVERY_E, bg_slot=_BG_SLOT_E, bg_concurrent=True)),
         "F": Config(2, 0, base),
+        "A-tree": Config(2, default_cache_ram_mib, base, ("--cache-tree",)),
+        "D-tree": Config(2, d_cache_ram_mib, base, ("--cache-tree",)),
+        "F-tree": Config(2, default_cache_ram_mib, base, ("--cache-tree",)),
     }
 
 
@@ -87,7 +94,7 @@ def server_args(model: str, cfg: Config, ctx: int, port: int, extra: list[str]) 
     args = ["-m", model, "-c", str(ctx), "-np", str(cfg.n_parallel), "--kv-unified", "-fa", "on", "-lv", "4", "--host", "127.0.0.1", "--port", str(port), "--no-webui"]
     if cfg.cache_ram_mib is not None:
         args += ["--cache-ram", str(cfg.cache_ram_mib)]
-    return args + extra
+    return args + list(cfg.server_extra) + extra
 
 
 def run_order(models: list[str], names: list[str], reps: int) -> list[tuple[str, int, str]]:
@@ -119,6 +126,10 @@ class Server(Protocol):
         """Returns device facts to store in the run metadata."""
         ...
 
+    def is_running(self) -> bool:
+        """Returns False once the server process has exited."""
+        ...
+
     def stop(self, log_path: Path) -> None:
         """Stops the server and makes sure its log is at ``log_path``."""
         ...
@@ -136,6 +147,9 @@ class LocalServer:
 
     def run_meta(self) -> dict[str, object]:
         return {}
+
+    def is_running(self) -> bool:
+        return self._proc.poll() is None
 
     def stop(self, log_path: Path) -> None:
         self._proc.terminate()
@@ -193,6 +207,9 @@ class AdbServer:
 
     def run_meta(self) -> dict[str, object]:
         return {"phone_mem_available_mib": self.mem_available_mib, "phone_clock_offset_s": self.clock_offset_s, "server_pid": self.pid}
+
+    def is_running(self) -> bool:
+        return str(self.pid) in self._shell(f"pidof {_SERVER_BINARY}").split()
 
     def stop(self, log_path: Path) -> None:
         self._shell(f"kill {self.pid}")
@@ -265,7 +282,7 @@ def main() -> None:
                 server = LocalServer(args.server_bin, sargs, output_path(prefix, ".server.log"))
             try:
                 client = ServerClient(f"http://127.0.0.1:{args.port}")
-                client.wait_ready(_READY_TIMEOUT_S)
+                client.wait_ready(_READY_TIMEOUT_S, server.is_running)
                 meta: dict[str, object] = {"device": args.device, "model": model_name, "config": name, "rep": rep, "server_args": sargs, "target": args.target, "taskset": args.taskset, **server.run_meta()}
                 metrics = run_rep(client, args.preset, Layout(args.layout), args.seed, run_cfg, prefix, server.telemetry(prefix), meta)
             finally:

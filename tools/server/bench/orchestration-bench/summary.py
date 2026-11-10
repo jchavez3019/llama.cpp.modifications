@@ -53,7 +53,7 @@ _CACHE_UPDATE_RE = re.compile(r"prompt cache update took ([\d.]+) ms")
 # Fork telemetry lines (info level): one per RAM cache save, and one per prompt start.
 _CACHE_SAVE_RE = re.compile(r"prompt cache save: (\d+) tokens, ([\d.]+) MiB, ([\d.]+) ms")
 _CACHE_USE_RE = re.compile(r"prompt cache use: src = (\w+), reused = (\d+), prefill = (\d+), load = ([\d.]+) ms, ([\d.]+) MiB")
-CACHE_SOURCES_: tuple[str, ...] = ("ram", "slot", "none")
+CACHE_SOURCES_: tuple[str, ...] = ("ram", "tree", "slot", "none")
 
 
 def quantile(values: list[float], q: float) -> float:
@@ -249,7 +249,7 @@ def markdown(root: Path) -> str:
 
     stage_cols = ["Device", "Model", "Config", "Stage", "Hit %", "Ideal %", "Prefill tok", "TTFT p50 ms", "TTFT p95 ms"]
     turn_cols = ["Device", "Model", "Config", "Reps", "Turn p50 ms", "Turn p95 ms", "Peak RSS MiB", "Peak VRAM MiB", "Peak BIG C", "Big MHz", "J/turn", "CPU J/turn",
-                 "Swap ms/turn", "Save ms/turn", "Load ms/turn", "Src ram/slot/none", "RAM restores", "RAM evictions", "Empty-slot skips", "Purges", "Full reprocess", "Errors"]
+                 "Swap ms/turn", "Save ms/turn", "Load ms/turn", "Src ram/tree/slot/none", "RAM restores", "RAM evictions", "Empty-slot skips", "Purges", "Full reprocess", "Errors"]
     stage_tbl = [_row(stage_cols), _row(["---"] * len(stage_cols))]
     turn_tbl = [_row(turn_cols), _row(["---"] * len(turn_cols))]
     for device, model, config, n_reps, m in rows:

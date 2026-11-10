@@ -643,6 +643,9 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
+    bool    cache_tree          = false; // fork-only: radix tree prompt cache in RAM, in place of the flat one
+    int32_t cache_tree_block    = 64;    // tokens per K/V block in the prompt tree
+    int32_t cache_tree_min_restore = 0;  // restore from the tree only if it gives more than this many extra tokens
 
     // llama-connect params
     bool        server_connect      = false;

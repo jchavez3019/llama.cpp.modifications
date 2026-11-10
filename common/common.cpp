@@ -1726,7 +1726,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
-    cparams.n_seq_max         = params.n_parallel;
+    // the prompt tree copies blocks through one extra scratch sequence, after the slots
+    cparams.n_seq_max         = params.n_parallel + (params.cache_tree && params.kv_unified ? 1 : 0);
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);

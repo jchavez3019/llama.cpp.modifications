@@ -369,6 +369,46 @@ Each tier evicts only nodes that no request uses and that have no children left 
 
 Only step 3 is metadata. With eager copying, step 1 is already done.
 
+### Hit count and aging
+
+A node's hit count says how often its prefix was reused. Aging makes old hits count less, so a prefix that was popular an hour ago does not outrank one that is used now.
+
+**What is stored.** The tree has a clock that ticks once per request. Each node stores two numbers:
+- `hits`: the hit count, as it was at the node's last use.
+- `t_last`: the clock value at the node's last use.
+
+**Counting a hit.** Each request matches its prompt against the tree. Every node on the matched path gets a hit, including the node where the match ends inside its run. So a system prompt shared by many conversations collects the hits of all of them, which is what keeps inner nodes alive.
+
+**Aged hits.** The count used for ranking is
+\[
+\text{aged}(N) = \text{hits}_N \gg \left\lfloor \frac{\text{clock} - t_{\text{last},N}}{P} \right\rfloor
+\]
+with \(P = 64\) requests. In words: the count is halved once for every full \(P\) requests since the node was last used. A right shift by \(k\) is a division by \(2^k\), rounded down. After 32 or more idle periods the result is 0 (a 32-bit shift by 32 or more is undefined in C++, so the code returns 0 directly).
+
+| Requests since last use | Halvings | Aged hits, if `hits` = 20 |
+| --- | --- | --- |
+| 0 to 63 | 0 | 20 |
+| 64 to 127 | 1 | 10 |
+| 128 to 191 | 2 | 5 |
+| 192 to 255 | 3 | 2 |
+| 256 to 319 | 4 | 1 |
+| 320 or more | 5 or more | 0 |
+
+This is exponential decay with a half-life of \(P\) requests, computed in steps. Each node's steps are measured from its own `t_last`, not from shared period boundaries.
+
+**Computed when read, stored when used.** No background task walks the tree to halve counts. The aged value is computed only when eviction ranks a node. When a node gets a hit, the stored count is replaced by its aged value plus one, and `t_last` is set to the clock:
+\[
+\text{hits}_N \leftarrow \text{aged}(N) + 1, \qquad t_{\text{last},N} \leftarrow \text{clock}
+\]
+Without the first step, a node idle for a long time would get its old count back on its next hit.
+
+**Ranking.** Eviction picks the leaf with the lowest aged hits, and among equal counts the lowest `t_last` (the least recently used). Inserting a prompt sets `t_last` on its path but adds no hit, so a one-off tail has 0 hits and goes first. Examples with \(P = 64\):
+- A stage prompt hit every 3 requests never goes a full period without a hit, so its count only grows.
+- In the cycle A, B, C, A, ... from the ranking rule above, all three keep high counts and the tails between them go first. Plain least-recently-used would evict the prefix needed next.
+- A conversation hit 20 times and then left drops to 0 after 320 requests, below any prefix that is still used.
+
+**Choosing \(P\).** A small \(P\) forgets fast and acts more like least-recently-used. A large \(P\) keeps old favorites longer. 64 requests is a first guess. It is a constant in `server-prompt-tree.cpp` and can become a flag if measurements show a need. The count is `uint32_t`, so it cannot overflow in practice: it needs about 4 billion hits without one idle period.
+
 ### Pruning short runs
 
 A restore always covers a run: the contiguous stretch of a path, from the deepest node in a faster tier down to the node where the match ends. So the pruning test is on the run that ends at a leaf, not on the leaf's own length. A leaf in a lower tier is dropped from that tier when its run is shorter than the tier's restore threshold.

@@ -17,6 +17,8 @@ add_library(${TARGET} STATIC
     server-decision.h
     server-context.cpp
     server-context.h
+    server-prompt-tree.cpp
+    server-prompt-tree.h
     server-realtime.cpp
     server-realtime.h
     server-stream.cpp

@@ -11,7 +11,7 @@ import time
 from dataclasses import asdict, dataclass, fields
 from enum import StrEnum
 from pathlib import Path
-from typing import IO, Iterator, Mapping, Sequence, Union
+from typing import IO, Callable, Iterator, Mapping, Sequence, Union
 
 import requests
 
@@ -205,14 +205,18 @@ class ServerClient:
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
 
-    def wait_ready(self, timeout_s: float) -> None:
+    def wait_ready(self, timeout_s: float, is_running: Callable[[], bool] | None = None) -> None:
         """Blocks until ``/health`` returns 200 (the model is loaded).
 
         :param timeout_s: Maximum wait time.
+        :param is_running: Returns False once the server process has exited. A server that crashes during loading then fails at once instead of after ``timeout_s``.
         :raises TimeoutError: If the server is not ready in time.
+        :raises RuntimeError: If ``is_running`` reports that the server exited.
         """
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
+            if is_running is not None and not is_running():
+                raise RuntimeError(f"server at {self.base_url} exited before it was ready")
             try:
                 if self.session.get(f"{self.base_url}/health", timeout=_HEALTH_TIMEOUT_S).status_code == _HTTP_OK:
                     return

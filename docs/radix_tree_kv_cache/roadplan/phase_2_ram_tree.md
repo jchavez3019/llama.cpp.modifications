@@ -7,7 +7,7 @@ Phase 2 replaces the flat RAM prompt cache (`server_prompt_cache`, a list of who
 Fix the two biggest Phase 0 losses without touching how slots own cells.
 
 - **Config F (overwrite, no RAM cache):** stages 1 and 2 should reuse 85-89% again, because their prefixes stay in the tree after the slot is overwritten.
-- **Config D (small RAM cache):** a shared prefix is stored once, not once per whole prompt, so stage 3 fits.
+- **Config D (small RAM cache):** no worse than D. The step 3 smoke run showed that stage 3 alone (117-149 MiB on the laptop, and about 138 MiB for the part that repeats each turn) is larger than D's 128 MiB, so storing shared prefixes once does not make it fit. Saving the part of a prompt that fits needs an eviction policy that does not thrash, and is left for later.
 
 ## Scope
 
@@ -45,7 +45,8 @@ Operations that move data, in the same file, using a scratch sequence ID:
 ### 3. Tests
 
 - Index tests in `tests/test-server-component.cpp` (the place for server component tests): split inside a node, match across splits, block ownership at a boundary, bottom-up eviction order, the run-based pruning cascade (the three examples in design.md).
-- One end-to-end check: config F with `--cache-tree`, Llama, and greedy outputs equal to config C for the same seed.
+- Restore check in `kv-block-bench` (`check_tree_*`): logits after a tree restore are bit-identical to a prefill with the same batch shapes.
+- One end-to-end check: greedy outputs of F-tree and of config C against a run without prompt cache. Exact equality with C is not a valid test on a GPU: K/V computed in prefill batches of other sizes round differently, and stock C already differs from the no-cache run on 10 of 24 requests in the step 3 smoke check.
 
 ## Measurements
 
@@ -62,8 +63,8 @@ Report: hit rate per stage, TTFT, turn time, energy (phone), RAM used by the tre
 ## Exit criteria
 
 - F-tree stage 1 and 2 hit rates within 2 points of the ideal on both devices.
-- D-tree stage 3 hit rate above 50% on both devices.
-- No change in greedy outputs against C.
+- D-tree hit rates and turn time no worse than D on both devices.
+- `check_tree_*` bit-identical, and F-tree greedy outputs differ from the no-cache run on no more requests than C's do.
 - Restore time per turn below A's swap time (85 ms phone, 131 ms laptop).
 
 ## Risks

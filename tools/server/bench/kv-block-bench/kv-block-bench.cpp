@@ -2,6 +2,7 @@
 // see docs/radix_tree_kv_cache/roadplan/phase_1_measurements.md
 
 #include "llama.h"
+#include "server-prompt-tree.h"
 
 #include <algorithm>
 #include <clocale>
@@ -355,6 +356,90 @@ static bool bench_block(bench_ctx & bc, const std::vector<llama_token> & tokens,
     return true;
 }
 
+/** @brief Decode tokens[0, n) in chunks of b. Prompts that share a prefix then get the same batch shapes, so the shared K/V are bit-identical. */
+static bool decode_chunked(bench_ctx & bc, const std::vector<llama_token> & tokens, int32_t n, int32_t b) {
+    for (int32_t p0 = 0; p0 < n; p0 += b) {
+        if (!decode_range(bc, tokens, p0, std::min(b, n - p0), SEQ_MAIN)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** @brief Restore the cached prefix of `prompt[0, n)` from the tree, probe position n, and compare with `ref`. */
+static void check_tree_case(bench_ctx & bc, server_prompt_tree & tree, const std::vector<llama_token> & prompt, int32_t n, int32_t b, const std::vector<float> & ref, const char * kind) {
+    llama_memory_clear(bc.mem, true);
+    const server_prompt_tree_match m = tree.match(llama_tokens(prompt.begin(), prompt.begin() + n));
+    const int32_t n_restored = tree.restore(bc.ctx, SEQ_MAIN, SEQ_SCRATCH, m);
+    llama_synchronize(bc.ctx);
+
+    std::vector<float> cur;
+    const bool ok = n_restored == n && llama_memory_seq_pos_max(bc.mem, SEQ_MAIN) == n - 1 && llama_memory_seq_pos_max(bc.mem, SEQ_SCRATCH) == -1 && probe_logits(bc, prompt, n, cur);
+    if (!ok) {
+        fprintf(stderr, "%s failed: n = %d, b = %d, restored = %d\n", kind, n, b, n_restored);
+        emit_check(bc, kind, n, b, INFINITY, false);
+        return;
+    }
+    float diff;
+    bool  match;
+    compare_logits(ref, cur, diff, match);
+    emit_check(bc, kind, n, b, diff, match);
+}
+
+/**
+ * @brief Check server_prompt_tree save and restore against a cold prefill (kinds check_tree_*).
+ *
+ * Prompt 1 has 4b tokens. Prompt 2 shares the first p tokens, with p in the middle of a block, then has its own tokens up to 3b + 5. Both are saved through the tree. Then three restores are checked:
+ * - branch: all of prompt 2, which ends in a short block
+ * - split:  all of prompt 1, whose node was split by prompt 2
+ * - inside: the first p - 1 tokens, whose last block belongs to a child
+ */
+static bool check_tree(bench_ctx & bc, const std::vector<llama_token> & tokens, int32_t b) {
+    const int32_t n1 = 4 * b;
+    const int32_t p  = b + b / 2 + 1;
+    const int32_t n2 = 3 * b + 5;
+
+    // each prompt has one extra token for the probe
+    const std::vector<llama_token> prompt1(tokens.begin(), tokens.begin() + n1 + 1);
+    std::vector<llama_token> prompt2(tokens.begin(), tokens.begin() + p);
+    prompt2.insert(prompt2.end(), tokens.end() - (n2 - p + 1), tokens.end());
+
+    // prefill, save the new blocks, then take the reference logits
+    server_prompt_tree tree(b);
+    std::vector<float> ref1;
+    std::vector<float> ref2;
+    std::vector<float> ref_inside;
+    for (int32_t i = 0; i < 2; ++i) {
+        const std::vector<llama_token> & prompt = i == 0 ? prompt1 : prompt2;
+        const int32_t n = i == 0 ? n1 : n2;
+        llama_memory_clear(bc.mem, true);
+        if (!decode_chunked(bc, prompt, n, b)) {
+            return false;
+        }
+        if (!tree.save_blocks(bc.ctx, SEQ_MAIN, SEQ_SCRATCH, tree.insert(llama_tokens(prompt.begin(), prompt.begin() + n)))) {
+            fprintf(stderr, "tree save failed: b = %d\n", b);
+            return false;
+        }
+        if (!probe_logits(bc, prompt, n, i == 0 ? ref1 : ref2)) {
+            return false;
+        }
+    }
+    // the inside restore can take its last block from either prompt, so the reference trims a full prefill instead of a shorter one with other batch shapes
+    llama_memory_clear(bc.mem, true);
+    if (!decode_chunked(bc, prompt1, n1, b)) {
+        return false;
+    }
+    llama_memory_seq_rm(bc.mem, SEQ_MAIN, p - 1, -1);
+    if (!probe_logits(bc, prompt1, p - 1, ref_inside)) {
+        return false;
+    }
+
+    check_tree_case(bc, tree, prompt2, n2,    b, ref2,       "check_tree_branch");
+    check_tree_case(bc, tree, prompt1, n1,    b, ref1,       "check_tree_split");
+    check_tree_case(bc, tree, prompt1, p - 1, b, ref_inside, "check_tree_inside");
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -462,6 +547,17 @@ int main(int argc, char ** argv) {
             }
         }
         fprintf(stderr, "n = %d done\n", n);
+    }
+
+    for (const int32_t b : args.b_list) {
+        // both prompts take distinct token ranges, and prompt 1 is one batch
+        if (!run_block || 7 * b + 7 > (int32_t) tokens.size() || 4 * b > (int32_t) cparams.n_batch) {
+            continue;
+        }
+        if (!check_tree(bc, tokens, b)) {
+            fprintf(stderr, "error: tree check failed for b = %d\n", b);
+            return 1;
+        }
     }
 
     fclose(out);

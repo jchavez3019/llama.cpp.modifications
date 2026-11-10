@@ -6,6 +6,7 @@
 #include "server-common.h"
 #include "server-decision.h"
 #include "server-http.h"
+#include "server-prompt-tree.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-realtime.h"
@@ -342,6 +343,7 @@ struct server_slot {
 
     // last prompt_load() of this slot, reported and reset when the next prompt starts
     bool    cache_loaded     = false;
+    bool    cache_from_tree  = false;
     double  cache_load_ms    = 0.0;
     size_t  cache_load_bytes = 0;
 
@@ -1150,6 +1152,11 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // set in place of prompt_cache by --cache-tree
+    std::unique_ptr<server_prompt_tree> prompt_tree;
+    llama_seq_id prompt_tree_seq   = -1;
+    size_t       prompt_tree_limit = 0;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1250,6 +1257,11 @@ private:
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+
+        // the context reserves outputs for at least n_seq_max sequences, which counts the prompt tree scratch sequence
+        if (params_base.cache_tree && params_base.kv_unified) {
+            params_base.n_outputs_max = std::max(params_base.n_outputs_max, params_base.n_parallel + 1);
+        }
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -1630,7 +1642,33 @@ private:
             params_base.cache_idle_slots = false;
         }
 
-        if (params_base.cache_ram_mib != 0) {
+        if (params_base.cache_tree) {
+            const char * reason = nullptr;
+            if (params_base.cache_ram_mib == 0) {
+                reason = "--cache-ram is 0";
+            } else if (!params_base.kv_unified || llama_n_seq_max(ctx_tgt) != (uint32_t) params_base.n_parallel + 1) {
+                reason = "it needs --kv-unified and one free sequence after the slots";
+            } else if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt) || llama_model_n_swa(model_tgt) != 0) {
+                reason = "blocks split K/V by position, which needs a full-attention model";
+            } else if (ctx_dft != nullptr || mctx != nullptr) {
+                reason = "draft and multimodal models are not supported yet";
+            } else if (params_base.ctx_shift || params_base.n_cache_reuse > 0) {
+                reason = "blocks need fixed positions, so context shift and --cache-reuse must be off";
+            }
+
+            if (reason != nullptr) {
+                SRV_WRN("--cache-tree is disabled, %s; using the flat prompt cache\n", reason);
+                params_base.cache_tree = false;
+            } else {
+                prompt_tree       = std::make_unique<server_prompt_tree>(params_base.cache_tree_block, params_base.cache_tree_min_restore);
+                prompt_tree_seq   = params_base.n_parallel;
+                prompt_tree_limit = params_base.cache_ram_mib < 0 ? SIZE_MAX : (size_t) params_base.cache_ram_mib * 1024 * 1024;
+                SRV_INF("prompt tree is enabled, block = %d tokens, min restore = %d tokens, limit = %d MiB\n",
+                        params_base.cache_tree_block, params_base.cache_tree_min_restore, params_base.cache_ram_mib);
+            }
+        }
+
+        if (params_base.cache_ram_mib != 0 && !prompt_tree) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
             } else {
@@ -1833,6 +1871,97 @@ private:
         return nullptr;
     }
 
+    /**
+     * @brief Saves the K/V of a slot into the prompt tree, then evicts down to the --cache-ram limit.
+     *
+     * Only blocks the tree does not have yet are copied, so a prefix that is already in the tree costs nothing. Logs the saved tokens, size, and time at info level, in the same format as prompt_save().
+     *
+     * @param slot An idle slot. Its K/V and tokens do not change.
+     */
+    void tree_save(const server_slot & slot) {
+        // tokens past the last cell, such as a sampled token that was never decoded, have no K/V
+        const llama_tokens & tokens = slot.prompt.tokens.get_tokens();
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        const size_t n = std::min(tokens.size(), (size_t) (pos_max + 1));
+        if (n == 0) {
+            return;
+        }
+
+        // a state larger than the limit would evict all other prompts and then itself
+        const size_t n_state = llama_state_seq_get_size(ctx_tgt, slot.id);
+        if (n_state > prompt_tree_limit) {
+            SLT_INF(slot, "prompt tree: skip save, state of %.3f MiB is larger than --cache-ram\n", n_state / (1024.0 * 1024.0));
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        std::vector<server_prompt_block *> blocks = prompt_tree->insert(llama_tokens(tokens.begin(), tokens.begin() + n));
+        const bool ok = prompt_tree->save_blocks(ctx_tgt, slot.id, prompt_tree_seq, blocks);
+
+        size_t n_saved = 0;
+        for (const server_prompt_block * b : blocks) {
+            n_saved += b->data.size();
+        }
+        if (!ok) {
+            SLT_ERR(slot, "%s", "failed to save blocks to the prompt tree\n");
+        }
+
+        const size_t n_freed = prompt_tree->evict(prompt_tree_limit);
+
+        SLT_INF(slot, "prompt cache save: %zu tokens, %.3f MiB, %.2f ms\n", n, n_saved / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
+        SLT_INF(slot, "prompt tree: %zu blocks saved, %.3f MiB evicted, %zu nodes, %.3f MiB\n",
+                blocks.size(), n_freed / (1024.0 * 1024.0), prompt_tree->n_nodes(), prompt_tree->n_bytes() / (1024.0 * 1024.0));
+    }
+
+    /**
+     * @brief Replaces the slot K/V with the prompt tree's prefix of `tokens`, if the tree has more than --cache-tree-min-restore extra tokens.
+     *
+     * Saves the slot to the tree first, so its K/V are not lost. Records the restore in cache_loaded, cache_from_tree, cache_load_ms, and cache_load_bytes. Counts a hit on the matched path in all cases, so the tree clock advances once per request.
+     *
+     * @param slot An idle slot.
+     * @param tokens The tokens of the new prompt.
+     */
+    void tree_load(server_slot & slot, const server_tokens & tokens) {
+        const llama_tokens & prompt = tokens.get_tokens();
+        const int32_t n_slot = (int32_t) slot.prompt.tokens.get_common_prefix(tokens);
+        const int32_t n_min  = n_slot + params_base.cache_tree_min_restore;
+
+        if (prompt_tree->match(prompt).n_restore <= n_min) {
+            prompt_tree->touch(prompt_tree->match(prompt));
+            return;
+        }
+
+        // saving can split nodes and evict, so match again after it
+        tree_save(slot);
+        const int64_t t_start = ggml_time_us();
+        const server_prompt_tree_match m = prompt_tree->match(prompt);
+        prompt_tree->touch(m);
+        if (m.n_restore <= n_min) {
+            return;
+        }
+
+        slot.prompt_clear();
+        const int32_t n_restored = prompt_tree->restore(ctx_tgt, slot.id, prompt_tree_seq, m);
+        if (n_restored == 0) {
+            SLT_WRN(slot, "%s", "failed to restore the prompt from the prompt tree\n");
+            return;
+        }
+        slot.prompt.tokens = server_tokens(llama_tokens(prompt.begin(), prompt.begin() + n_restored), false);
+
+        size_t n_bytes = 0;
+        for (const server_prompt_block * b : m.blocks) {
+            n_bytes += b->data.size();
+        }
+        slot.cache_loaded     = true;
+        slot.cache_from_tree  = true;
+        slot.cache_load_ms    = (ggml_time_us() - t_start) / 1000.0;
+        slot.cache_load_bytes = n_bytes;
+
+        SLT_INF(slot, "prompt tree restore: %d tokens (slot had %d), %zu blocks, %.3f MiB, %.2f ms\n",
+                n_restored, n_slot, m.blocks.size(), n_bytes / (1024.0 * 1024.0), slot.cache_load_ms);
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1914,6 +2043,14 @@ private:
 
                 update_cache = true;
             }
+        }
+
+        // the tree also loads when the slot keeps its state, because it can hold a longer prefix than any slot
+        if (ret && prompt_tree && !task.is_stateless()) {
+            if (update_cache) {
+                tree_save(*ret);
+            }
+            tree_load(*ret, task.tokens);
         }
 
         if (ret) {
@@ -2753,6 +2890,8 @@ private:
             // keep the state that the child task is about to overwrite
             if (prompt_cache && slot->prompt_save(*prompt_cache)) {
                 prompt_cache->update();
+            } else if (prompt_tree) {
+                tree_save(*slot);
             }
 
             int id_child = parent_task.child_tasks[idx].id;
@@ -3155,7 +3294,9 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                if (prompt_tree) {
+                                    tree_save(slot);
+                                } else if (slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
@@ -4407,10 +4548,11 @@ private:
                         }
 
                         SLT_INF(slot, "prompt cache use: src = %s, reused = %d, prefill = %d, load = %.2f ms, %.3f MiB\n",
-                                slot.cache_loaded ? "ram" : (n_past > 0 ? "slot" : "none"), n_past, slot.task->n_tokens() - n_past,
+                                slot.cache_loaded ? (slot.cache_from_tree ? "tree" : "ram") : (n_past > 0 ? "slot" : "none"), n_past, slot.task->n_tokens() - n_past,
                                 slot.cache_load_ms, slot.cache_load_bytes / (1024.0 * 1024.0));
 
                         slot.cache_loaded     = false;
+                        slot.cache_from_tree  = false;
                         slot.cache_load_ms    = 0.0;
                         slot.cache_load_bytes = 0;
 

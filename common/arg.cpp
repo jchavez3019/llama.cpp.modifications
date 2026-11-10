@@ -1692,6 +1692,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-tree"},
+        {"--no-cache-tree"},
+        "use a radix tree of K/V blocks as the RAM prompt cache, limited by --cache-ram (default: disabled, requires --kv-unified and a full-attention model)",
+        [](common_params & params, bool value) {
+            params.cache_tree = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_TREE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-tree-block"}, "N",
+        string_format("tokens per K/V block in the prompt tree (default: %d)", params.cache_tree_block),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--cache-tree-block must be positive");
+            }
+            params.cache_tree_block = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_TREE_BLOCK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-tree-min-restore"}, "N",
+        string_format("restore from the prompt tree only if it gives more than N extra tokens over the slot (default: %d)", params.cache_tree_min_restore),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--cache-tree-min-restore must not be negative");
+            }
+            params.cache_tree_min_restore = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_TREE_MIN_RESTORE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

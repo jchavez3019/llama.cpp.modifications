@@ -2,6 +2,7 @@
 
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-decision.h"
+#include "../tools/server/server-prompt-tree.h"
 #include "../tools/server/server-schema.h"
 
 #include <algorithm>
@@ -665,6 +666,290 @@ static void test_glob_match(testing & t) {
     });
 }
 
+//
+// server_prompt_tree
+//
+
+static llama_tokens tree_seq(llama_token first, int32_t n) {
+    llama_tokens res(n);
+    for (int32_t i = 0; i < n; ++i) {
+        res[i] = first + i;
+    }
+    return res;
+}
+
+static llama_tokens tree_cat(const llama_tokens & a, const llama_tokens & b) {
+    llama_tokens res = a;
+    res.insert(res.end(), b.begin(), b.end());
+    return res;
+}
+
+// fake data of one byte per token
+static void tree_fill(server_prompt_tree & tree, const std::vector<server_prompt_block *> & blocks) {
+    for (server_prompt_block * b : blocks) {
+        tree.set_data(b, std::vector<uint8_t>(b->n_tokens, 1));
+    }
+}
+
+// "pos0:n_tokens" per block, "!" marks a block without data
+// one server request: match and touch, then insert and fill
+static void tree_request(server_prompt_tree & tree, const llama_tokens & tokens) {
+    tree.touch(tree.match(tokens));
+    tree_fill(tree, tree.insert(tokens));
+}
+
+static std::string tree_blocks(const server_prompt_tree_node & node) {
+    std::string res;
+    for (const server_prompt_block & b : node.blocks) {
+        res += (res.empty() ? "" : " ") + std::to_string(b.pos0) + ":" + std::to_string(b.n_tokens) + (b.data.empty() ? "!" : "");
+    }
+    return res;
+}
+
+static size_t tree_count_bytes(const server_prompt_tree & tree) {
+    size_t n = 0;
+    std::vector<const server_prompt_tree_node *> stack = { &tree.get_root() };
+    while (!stack.empty()) {
+        const server_prompt_tree_node * node = stack.back();
+        stack.pop_back();
+        for (const server_prompt_block & b : node->blocks) {
+            n += b.data.size();
+        }
+        for (const auto & [tok, child] : node->children) {
+            stack.push_back(child.get());
+        }
+    }
+    return n;
+}
+
+/**
+ * Given: an empty tree with block size 4
+ * When:  a prompt of 10 tokens is inserted and its blocks are filled
+ * Then:  one leaf owns two full blocks and a short last block of 2 tokens, and the byte count is 10
+ */
+static void test_prompt_tree_insert_leaf_owns_full_and_short_blocks(testing & t) {
+    server_prompt_tree tree(4);
+    std::vector<server_prompt_block *> blocks = tree.insert(tree_seq(100, 10));
+
+    t.assert_equal("blocks to fill", (size_t) 3, blocks.size());
+    t.assert_equal("nodes", (size_t) 1, tree.n_nodes());
+    t.assert_equal("layout before fill", std::string("0:4! 4:4! 8:2!"), tree_blocks(*tree.match(tree_seq(100, 10)).path.back()));
+
+    tree_fill(tree, blocks);
+    t.assert_equal("layout after fill", std::string("0:4 4:4 8:2"), tree_blocks(*tree.match(tree_seq(100, 10)).path.back()));
+    t.assert_equal("bytes", (size_t) 10, tree.n_bytes());
+    t.assert_equal("bytes match data", tree_count_bytes(tree), tree.n_bytes());
+}
+
+/**
+ * Given: a filled leaf S of 10 tokens with block size 4
+ * When:  a prompt that extends S by 10 tokens is inserted
+ * Then:  S drops its short block, the new child A owns the block at 8 that crosses the boundary, and only A's blocks are returned
+ */
+static void test_prompt_tree_extension_frees_parent_short_block(testing & t) {
+    server_prompt_tree tree(4);
+    const llama_tokens s = tree_seq(100, 10);
+    tree_fill(tree, tree.insert(s));
+
+    std::vector<server_prompt_block *> blocks = tree.insert(tree_cat(s, tree_seq(200, 10)));
+    server_prompt_tree_match m = tree.match(tree_cat(s, tree_seq(200, 10)));
+
+    t.assert_equal("path length", (size_t) 2, m.path.size());
+    t.assert_equal("S layout", std::string("0:4 4:4"), tree_blocks(*m.path[0]));
+    t.assert_equal("A layout", std::string("8:4! 12:4! 16:4!"), tree_blocks(*m.path[1]));
+    t.assert_equal("blocks to fill", (size_t) 3, blocks.size());
+    t.assert_equal("bytes after short block freed", (size_t) 8, tree.n_bytes());
+    t.assert_equal("bytes match data", tree_count_bytes(tree), tree.n_bytes());
+}
+
+/**
+ * Given: a filled 20 token prompt S+A with block size 4, where S is 10 tokens
+ * When:  prompts S+B, S+C and S+D are inserted and filled
+ * Then:  the split moves A's blocks without loss, each child owns its own copy of block 8, and the tree holds (k-1)*(10 mod 4) = 6 duplicate tokens
+ */
+static void test_prompt_tree_split_duplicates_boundary_block(testing & t) {
+    server_prompt_tree tree(4);
+    const llama_tokens s = tree_seq(100, 10);
+    tree_fill(tree, tree.insert(tree_cat(s, tree_seq(200, 10))));
+
+    std::vector<server_prompt_block *> blocks = tree.insert(tree_cat(s, tree_seq(300, 10)));
+    t.assert_equal("blocks to fill after split", (size_t) 3, blocks.size());
+    tree_fill(tree, blocks);
+    tree_fill(tree, tree.insert(tree_cat(s, tree_seq(400, 10))));
+    tree_fill(tree, tree.insert(tree_cat(s, tree_seq(500, 10))));
+
+    server_prompt_tree_match ma = tree.match(tree_cat(s, tree_seq(200, 10)));
+    t.assert_equal("S layout", std::string("0:4 4:4"), tree_blocks(*ma.path[0]));
+    t.assert_equal("A keeps its data", std::string("8:4 12:4 16:4"), tree_blocks(*ma.path[1]));
+    t.assert_equal("S children", (size_t) 4, ma.path[0]->children.size());
+
+    const size_t n_unique = 10 + 4 * 10;
+    t.assert_equal("duplicate tokens", (size_t) 3 * 2, tree.n_bytes() - n_unique);
+    t.assert_equal("bytes match data", tree_count_bytes(tree), tree.n_bytes());
+}
+
+/**
+ * Given: a filled prompt S+A and an unfilled prompt S+B, block size 4, S is 10 tokens
+ * When:  prompts are matched that end inside S, at the end of S, inside A, at an unfilled block, and before the root
+ * Then:  the restorable length stops at the first block without data and borrows a child's boundary block when the match ends in S
+ */
+static void test_prompt_tree_match_restorable_length(testing & t) {
+    server_prompt_tree tree(4);
+    const llama_tokens s = tree_seq(100, 10);
+    tree_fill(tree, tree.insert(tree_cat(s, tree_seq(200, 10))));
+    tree.insert(tree_cat(s, tree_seq(300, 10)));
+
+    server_prompt_tree_match m = tree.match(tree_seq(100, 9));
+    t.assert_equal("inside S: match", 9, m.n_match);
+    t.assert_equal("inside S: restore", 9, m.n_restore);
+    t.assert_equal("inside S: blocks", (size_t) 3, m.blocks.size());
+
+    m = tree.match(s);
+    t.assert_equal("end of S: match", 10, m.n_match);
+    t.assert_equal("end of S: restore", 10, m.n_restore);
+
+    m = tree.match(tree_cat(s, { 200, 999, 998 }));
+    t.assert_equal("inside A: match", 11, m.n_match);
+    t.assert_equal("inside A: restore", 11, m.n_restore);
+    t.assert_equal("inside A: last block", 8, m.blocks.back()->pos0);
+
+    m = tree.match(tree_cat(s, tree_seq(300, 10)));
+    t.assert_equal("unfilled B: match", 20, m.n_match);
+    t.assert_equal("unfilled B: restore", 8, m.n_restore);
+
+    m = tree.match(tree_seq(900, 5));
+    t.assert_equal("no match", 0, m.n_match);
+    t.assert_equal("no restore", 0, m.n_restore);
+}
+
+/**
+ * Given: three requests that add filled leaves X, Y, Z in that order, then a request that hits X
+ * When:  the tree is evicted down to the size of two leaves
+ * Then:  Y goes first, because it has no hits and is older than Z
+ */
+static void test_prompt_tree_evict_lowest_hits_then_oldest(testing & t) {
+    server_prompt_tree tree(4);
+    tree_request(tree, tree_seq(100, 4));
+    tree_request(tree, tree_seq(200, 4));
+    tree_request(tree, tree_seq(300, 4));
+    tree.touch(tree.match(tree_seq(100, 4)));
+
+    t.assert_equal("freed", (size_t) 4, tree.evict(8));
+    t.assert_equal("X kept", 4, tree.match(tree_seq(100, 4)).n_match);
+    t.assert_equal("Y evicted", 0, tree.match(tree_seq(200, 4)).n_match);
+    t.assert_equal("Z kept", 4, tree.match(tree_seq(300, 4)).n_match);
+    t.assert_equal("bytes match data", tree_count_bytes(tree), tree.n_bytes());
+}
+
+/**
+ * Given: a node X touched once, and an age period of 64 requests
+ * When:  X is touched again right away, or after 128 requests that match nothing
+ * Then:  the count grows to 2 right away, but after two periods the old hit is halved twice to 0 before the new hit is added
+ */
+static void test_prompt_tree_touch_ages_old_hits(testing & t) {
+    t.test("touch right away", [](testing & t) {
+        server_prompt_tree tree(4);
+        tree.insert(tree_seq(100, 4));
+        tree.touch(tree.match(tree_seq(100, 4)));
+        tree.touch(tree.match(tree_seq(100, 4)));
+        t.assert_equal("hits", (uint32_t) 2, tree.match(tree_seq(100, 4)).path[0]->hits);
+    });
+    t.test("touch after two periods", [](testing & t) {
+        server_prompt_tree tree(4);
+        tree.insert(tree_seq(100, 4));
+        tree.touch(tree.match(tree_seq(100, 4)));
+        for (int32_t i = 0; i < 128; ++i) {
+            tree.touch(tree.match(tree_seq(200, 4)));
+        }
+        tree.touch(tree.match(tree_seq(100, 4)));
+        t.assert_equal("hits", (uint32_t) 1, tree.match(tree_seq(100, 4)).path[0]->hits);
+    });
+}
+
+/**
+ * Given: a filled prompt S+A, block size 4, S is 10 tokens
+ * When:  the only child A is evicted
+ * Then:  S becomes a leaf with an unfilled short block, so only 8 of its 10 tokens can be restored
+ */
+static void test_prompt_tree_evict_last_child_loses_boundary_data(testing & t) {
+    server_prompt_tree tree(4);
+    const llama_tokens s = tree_seq(100, 10);
+    tree_fill(tree, tree.insert(s));
+    tree_fill(tree, tree.insert(tree_cat(s, tree_seq(200, 10))));
+
+    tree.evict(tree.n_bytes() - 1);
+    server_prompt_tree_match m = tree.match(s);
+
+    t.assert_equal("nodes", (size_t) 1, tree.n_nodes());
+    t.assert_equal("S layout", std::string("0:4 4:4 8:2!"), tree_blocks(*m.path[0]));
+    t.assert_equal("restore", 8, m.n_restore);
+    t.assert_equal("bytes", (size_t) 8, tree.n_bytes());
+}
+
+/**
+ * Given: a restore threshold of 100 and chains A(30)-B(50)-C(50) and A(60)-B(50)-C(50)
+ * When:  the leaf C is evicted
+ * Then:  in the first chain B (ends at 80) and A (ends at 30) are pruned too; in the second chain B ends at 110 and is kept
+ */
+static void test_prompt_tree_evict_prunes_short_runs(testing & t) {
+    t.test("short chain is pruned", [](testing & t) {
+        server_prompt_tree tree(4, 100);
+        const llama_tokens a  = tree_seq(100, 30);
+        const llama_tokens ab = tree_cat(a, tree_seq(200, 50));
+        tree_fill(tree, tree.insert(a));
+        tree_fill(tree, tree.insert(ab));
+        const size_t n_bytes_ab = tree.n_bytes();
+        tree_fill(tree, tree.insert(tree_cat(ab, tree_seq(300, 50))));
+
+        tree.evict(n_bytes_ab);
+        t.assert_equal("nodes", (size_t) 0, tree.n_nodes());
+        t.assert_equal("bytes", (size_t) 0, tree.n_bytes());
+    });
+    t.test("long chain is kept", [](testing & t) {
+        server_prompt_tree tree(4, 100);
+        const llama_tokens a  = tree_seq(100, 60);
+        const llama_tokens ab = tree_cat(a, tree_seq(200, 50));
+        tree_fill(tree, tree.insert(a));
+        tree_fill(tree, tree.insert(ab));
+        tree_fill(tree, tree.insert(tree_cat(ab, tree_seq(300, 50))));
+
+        tree.evict(108);
+        server_prompt_tree_match m = tree.match(ab);
+        t.assert_equal("nodes", (size_t) 2, tree.n_nodes());
+        t.assert_equal("restore", 108, m.n_restore);
+        t.assert_equal("bytes match data", tree_count_bytes(tree), tree.n_bytes());
+    });
+}
+
+/**
+ * Given: a tree with a 40 byte limit
+ * When:  20 prompts that share a 6 token prefix and differ after it are inserted, filled and evicted one after another
+ * Then:  the byte count never exceeds the limit and always equals the sum of block data
+ */
+static void test_prompt_tree_evict_keeps_byte_limit(testing & t) {
+    server_prompt_tree tree(4);
+    const llama_tokens s = tree_seq(100, 6);
+    bool ok = true;
+    for (int32_t i = 0; i < 20; ++i) {
+        tree_fill(tree, tree.insert(tree_cat(s, tree_seq(1000 * (i + 1), 7 + i % 5))));
+        tree.evict(40);
+        ok = ok && tree.n_bytes() <= 40 && tree.n_bytes() == tree_count_bytes(tree);
+    }
+    t.assert_true("limit kept and bytes in sync", ok);
+}
+
+static void test_prompt_tree(testing & t) {
+    t.test("insert_leaf",       test_prompt_tree_insert_leaf_owns_full_and_short_blocks);
+    t.test("extension",         test_prompt_tree_extension_frees_parent_short_block);
+    t.test("split_duplicates",  test_prompt_tree_split_duplicates_boundary_block);
+    t.test("match_restore",     test_prompt_tree_match_restorable_length);
+    t.test("evict_order",       test_prompt_tree_evict_lowest_hits_then_oldest);
+    t.test("touch_aging",       test_prompt_tree_touch_ages_old_hits);
+    t.test("evict_last_child",  test_prompt_tree_evict_last_child_loses_boundary_data);
+    t.test("evict_prune",       test_prompt_tree_evict_prunes_short_runs);
+    t.test("evict_byte_limit",  test_prompt_tree_evict_keeps_byte_limit);
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -690,6 +975,7 @@ int main(int argc, char ** argv) {
     t.test("decision_depth",  test_decision_depth);
     t.test("glob_match",      test_glob_match);
     t.test("dry_sequence_breakers", test_dry_sequence_breakers);
+    t.test("prompt_tree",     test_prompt_tree);
 
     return t.summary();
 }
