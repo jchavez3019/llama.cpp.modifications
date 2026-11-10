@@ -110,15 +110,14 @@ struct server_prompt_tree {
     /**
      * @brief Saves the K/V of `blocks` from a sequence into the tree.
      *
-     * Each block is copied to `seq_scratch` by position range, saved, and removed from `seq_scratch`.
+     * All blocks are saved with one llama_state_seq_get_data_ranges() call, then split into one buffer per block.
      *
      * @param ctx The context that holds the sequence.
      * @param seq_id The sequence that holds the positions of all blocks.
-     * @param seq_scratch An empty sequence, used only for the copy.
      * @param blocks Blocks returned by insert(), with no other tree call in between.
-     * @return False if a save fails. Blocks saved before the failure keep their data.
+     * @return False if the save fails. Then no block gets data.
      */
-    bool save_blocks(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_scratch, const std::vector<server_prompt_block *> & blocks);
+    bool save_blocks(llama_context * ctx, llama_seq_id seq_id, const std::vector<server_prompt_block *> & blocks);
 
     /**
      * @brief Restores the positions [0, m.n_restore) of a match into a sequence.

@@ -157,11 +157,16 @@ public:
     // llama_kv_cache specific API
     //
 
+    // same format as state_write(), but only the cells with a position in [p0, p1)
+    void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+
     uint32_t get_size()     const;
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
+
+    llama_swa_type get_swa_type() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

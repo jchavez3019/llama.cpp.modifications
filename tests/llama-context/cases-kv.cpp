@@ -713,6 +713,115 @@ struct case_state_restore_fragmented : ctx_test {
     }
 };
 
+/**
+ * Given: a prompt on seq 0, in ctx and in ctx_keep
+ * When:  seq 0 is saved as position ranges with llama_state_seq_get_data_ranges(), removed, and restored range by range
+ * Then:  one range over all positions is the same blob as llama_state_seq_get_data(), and seq 0 continues as in ctx_keep
+ *        recurrent and hybrid memory refuses ranges
+ */
+struct case_state_ranges : ctx_test {
+    const char * name() const override { return "ranges"; }
+
+    const char * description() const override {
+        return "a sequence saved as position ranges restores range by range to the same state";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        ctx_opts opts;
+        opts.n_ctx      = 256;
+        opts.n_seq_max  = 2;
+        opts.kv_unified = 1;
+
+        llama_context_ptr ctx      = mr.ctx(opts);
+        llama_context_ptr ctx_keep = mr.ctx(opts);
+        if (!ctx || !ctx_keep) {
+            return case_result::fail();
+        }
+
+        llama_memory_t mem = llama_get_memory(ctx.get());
+        if (mem == nullptr) {
+            TLOG_INF("no memory to test\n");
+            return case_result::pass();
+        }
+
+        const llama_pos n_tokens = (llama_pos) std::min<size_t>(64, mr.tokens.size());
+        if (!decode_seq(ctx.get(), mr.tokens, 0, n_tokens, 0, true) || !decode_seq(ctx_keep.get(), mr.tokens, 0, n_tokens, 0, true)) {
+            TLOG_ERR("%s: failed to decode the prompt\n", __func__);
+            return case_result::fail();
+        }
+
+        // ranges of 16 positions, the last one can be shorter
+        std::vector<llama_pos> p0;
+        std::vector<llama_pos> p1;
+        for (llama_pos p = 0; p < n_tokens; p += 16) {
+            p0.push_back(p);
+            p1.push_back(std::min(p + 16, n_tokens));
+        }
+        const int32_t n_ranges = (int32_t) p0.size();
+
+        std::vector<size_t> sizes(n_ranges);
+        const size_t size = llama_state_seq_get_size_ranges(ctx.get(), 0, p0.data(), p1.data(), n_ranges, sizes.data());
+
+        // llama_model_n_swa() can be set for a model that uses no SWA layers, so only recurrent and hybrid memory must refuse
+        if (llama_model_is_recurrent(mr.model) || llama_model_is_hybrid(mr.model)) {
+            CTX_REQUIRE(size == 0, "recurrent or hybrid memory accepted a range save");
+            return case_result::pass();
+        }
+        if (size == 0) {
+            return case_result::skip("this memory type has no range save");
+        }
+
+        std::vector<uint8_t> whole;
+        if (!get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, whole)) {
+            return case_result::fail();
+        }
+        const llama_pos p_all0 = 0;
+        const llama_pos p_all1 = n_tokens;
+        std::vector<uint8_t> whole_range(whole.size());
+        CTX_REQUIRE(llama_state_seq_get_data_ranges(ctx.get(), whole_range.data(), whole_range.size(), 0, &p_all0, &p_all1, 1) == whole.size(),
+                "a range over all positions has a different size than the sequence state");
+        CTX_REQUIRE(blobs_equal(whole, whole_range), "a range over all positions is not the same blob as the sequence state");
+
+        std::vector<uint8_t> data(size);
+        CTX_REQUIRE(llama_state_seq_get_data_ranges(ctx.get(), data.data(), data.size(), 0, p0.data(), p1.data(), n_ranges) == size,
+                "the range save wrote a different size than reported");
+
+        // set_data clears its target sequence, so each range goes through seq 1
+        llama_memory_seq_rm(mem, 0, -1, -1);
+        size_t offset = 0;
+        for (int32_t i = 0; i < n_ranges; ++i) {
+            CTX_REQUIRE(llama_state_seq_set_data(ctx.get(), data.data() + offset, sizes[i], 1) == sizes[i],
+                    "failed to restore range " + std::to_string(i));
+            llama_memory_seq_cp(mem, 1, 0, -1, -1);
+            llama_memory_seq_rm(mem, 1, -1, -1);
+            offset += sizes[i];
+        }
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 0) == n_tokens - 1, "the restored sequence does not end at the last position");
+
+        const llama_token token = gen_token(n_vocab, 0, n_tokens);
+        if (!decode_one(ctx.get(), token, n_tokens, 0) || !decode_one(ctx_keep.get(), token, n_tokens, 0)) {
+            TLOG_ERR("%s: failed to decode with the restored state\n", __func__);
+            return case_result::fail();
+        }
+
+        const float * logits      = llama_get_logits(ctx.get());
+        const float * logits_keep = llama_get_logits(ctx_keep.get());
+        if (!logits || !logits_keep) {
+            TLOG_ERR("%s: missing logits after the restore\n", __func__);
+            return case_result::fail();
+        }
+
+        const logits_diff diff = compare_logits(logits, logits_keep, n_vocab);
+        CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "the logits after the range restore differ from the reference: nmse " + std::to_string(diff.nmse()));
+
+        TLOG_INF("%s: %d ranges, %zu bytes, nmse %g\n", __func__, n_ranges, size, diff.nmse());
+
+        return case_result::pass();
+    }
+};
+
 //
 // no_alloc
 //
@@ -834,6 +943,7 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_state_restore_failure>());
     cases.push_back(std::make_unique<case_state_rotation>());
     cases.push_back(std::make_unique<case_state_restore_fragmented>());
+    cases.push_back(std::make_unique<case_state_ranges>());
     cases.push_back(std::make_unique<case_noalloc>());
     cases.push_back(std::make_unique<case_comp_padding>());
 

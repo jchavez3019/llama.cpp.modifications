@@ -1272,6 +1272,10 @@ bool llama_kv_cache::get_has_shift() const {
     return result;
 }
 
+llama_swa_type llama_kv_cache::get_swa_type() const {
+    return swa_type;
+}
+
 ggml_type llama_kv_cache::type_k() const {
     return layers[0].k->type;
 }
@@ -2207,12 +2211,16 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
-    if (other) {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE) {
         return;
     }
 
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE) {
+    state_write_range(io, seq_id, std::numeric_limits<llama_pos>::min(), std::numeric_limits<llama_pos>::max());
+}
+
+void llama_kv_cache::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
         return;
     }
 
@@ -2234,6 +2242,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+            add_cell = add_cell && cells.pos_in(i, p0, p1);
 
             // check the cell is not SWA-masked
             if (add_cell && seq_id != -1) {

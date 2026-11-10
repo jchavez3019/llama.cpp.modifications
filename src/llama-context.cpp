@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -3742,6 +3743,27 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     }
 }
 
+size_t llama_context::state_seq_get_size_ranges(llama_seq_id seq_id, const llama_pos * p0, const llama_pos * p1, int32_t n_ranges, size_t * sizes) {
+    llama_io_write_dummy io(false);
+    try {
+        return state_seq_write_ranges(io, seq_id, p0, p1, n_ranges, sizes);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_get_data_ranges(llama_seq_id seq_id, const llama_pos * p0, const llama_pos * p1, int32_t n_ranges, uint8_t * dst, size_t size) {
+    // one io for all ranges, so its destructor reads all tensor data in one batch
+    llama_io_write_host io(dst, size);
+    try {
+        return state_seq_write_ranges(io, seq_id, p0, p1, n_ranges, nullptr);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
 
@@ -3933,6 +3955,32 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (memory) {
         memory->state_read(io, seq_id, flags);
+    }
+
+    return io.n_bytes();
+}
+
+size_t llama_context::state_seq_write_ranges(llama_io_write_i & io, llama_seq_id seq_id, const llama_pos * p0, const llama_pos * p1, int32_t n_ranges, size_t * sizes) {
+    // other memory types (SWA, recurrent, hybrid) do not keep every position, so a range is not a valid state
+    const auto * kv = dynamic_cast<const llama_kv_cache *>(memory.get());
+    if (kv == nullptr || kv->get_swa_type() != LLAMA_SWA_TYPE_NONE) {
+        throw std::runtime_error("position ranges need a KV cache without SWA, recurrent or hybrid layers");
+    }
+    if (seq_id < 0 || n_ranges < 0) {
+        throw std::runtime_error("invalid seq_id or n_ranges");
+    }
+
+    for (int32_t i = 0; i < n_ranges; ++i) {
+        const size_t n_bytes_start = io.n_bytes();
+
+        // each range gets the full header, so it loads with llama_state_seq_set_data()
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+        kv->state_write_range(io, seq_id, p0[i], p1[i]);
+
+        if (sizes != nullptr) {
+            sizes[i] = io.n_bytes() - n_bytes_start;
+        }
     }
 
     return io.n_bytes();
@@ -4851,6 +4899,16 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_get_size_ranges(llama_context * ctx, llama_seq_id seq_id, const llama_pos * p0, const llama_pos * p1, int32_t n_ranges, size_t * sizes) {
+    return ctx->state_seq_get_size_ranges(seq_id, p0, p1, n_ranges, sizes);
+}
+
+size_t llama_state_seq_get_data_ranges(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, const llama_pos * p0, const llama_pos * p1, int32_t n_ranges) {
+    ctx->synchronize();
+
+    return ctx->state_seq_get_data_ranges(seq_id, p0, p1, n_ranges, dst, size);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

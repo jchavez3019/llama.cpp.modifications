@@ -199,21 +199,35 @@ size_t server_prompt_tree::evict(size_t n_bytes_max) {
     return n_bytes_before - n_bytes_total;
 }
 
-bool server_prompt_tree::save_blocks(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_scratch, const std::vector<server_prompt_block *> & blocks) {
-    llama_memory_t mem = llama_get_memory(ctx);
+bool server_prompt_tree::save_blocks(llama_context * ctx, llama_seq_id seq_id, const std::vector<server_prompt_block *> & blocks) {
+    if (blocks.empty()) {
+        return true;
+    }
 
-    for (server_prompt_block * b : blocks) {
-        llama_memory_seq_cp(mem, seq_id, seq_scratch, b->pos0, b->pos0 + b->n_tokens);
+    const int32_t n_blocks = (int32_t) blocks.size();
+    std::vector<llama_pos> p0(n_blocks);
+    std::vector<llama_pos> p1(n_blocks);
+    for (int32_t i = 0; i < n_blocks; ++i) {
+        p0[i] = blocks[i]->pos0;
+        p1[i] = blocks[i]->pos0 + blocks[i]->n_tokens;
+    }
 
-        const size_t size = llama_state_seq_get_size(ctx, seq_scratch);
-        std::vector<uint8_t> data(size);
-        const size_t n_written = llama_state_seq_get_data(ctx, data.data(), data.size(), seq_scratch);
-        llama_memory_seq_rm(mem, seq_scratch, -1, -1);
+    std::vector<size_t> sizes(n_blocks);
+    const size_t size = llama_state_seq_get_size_ranges(ctx, seq_id, p0.data(), p1.data(), n_blocks, sizes.data());
+    if (size == 0) {
+        return false;
+    }
 
-        if (size == 0 || n_written != size) {
-            return false;
-        }
-        set_data(b, std::move(data));
+    // one buffer for all blocks, so the K/V of all blocks is read from the device in one batch
+    std::unique_ptr<uint8_t[]> buf(new uint8_t[size]);
+    if (llama_state_seq_get_data_ranges(ctx, buf.get(), size, seq_id, p0.data(), p1.data(), n_blocks) != size) {
+        return false;
+    }
+
+    size_t offset = 0;
+    for (int32_t i = 0; i < n_blocks; ++i) {
+        set_data(blocks[i], std::vector<uint8_t>(buf.get() + offset, buf.get() + offset + sizes[i]));
+        offset += sizes[i];
     }
 
     return true;

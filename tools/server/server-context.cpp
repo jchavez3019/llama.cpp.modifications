@@ -1897,7 +1897,7 @@ private:
         const int64_t t_start = ggml_time_us();
 
         std::vector<server_prompt_block *> blocks = prompt_tree->insert(llama_tokens(tokens.begin(), tokens.begin() + n));
-        const bool ok = prompt_tree->save_blocks(ctx_tgt, slot.id, prompt_tree_seq, blocks);
+        const bool ok = prompt_tree->save_blocks(ctx_tgt, slot.id, blocks);
 
         size_t n_saved = 0;
         for (const server_prompt_block * b : blocks) {

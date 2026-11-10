@@ -953,6 +953,29 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // Get the size needed to copy the positions [p0[i], p1[i]) of a sequence, for each of n_ranges ranges
+    // sizes (optional) gets the size of each range. Only for a KV cache without SWA, recurrent or hybrid layers
+    // Returns the total size, or 0 on error
+    LLAMA_API size_t llama_state_seq_get_size_ranges(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+               const llama_pos   * p0,
+               const llama_pos   * p1,
+                         int32_t   n_ranges,
+                          size_t * sizes);
+
+    // Copy the ranges into dst one after the other. Each range loads with llama_state_seq_set_data
+    // Reads the tensor data of all ranges in one batch, which is faster than one llama_state_seq_get_data call per range
+    // Returns the total size written, or 0 on error
+    LLAMA_API size_t llama_state_seq_get_data_ranges(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+               const llama_pos   * p0,
+               const llama_pos   * p1,
+                         int32_t   n_ranges);
+
     //
     // Decoding
     //

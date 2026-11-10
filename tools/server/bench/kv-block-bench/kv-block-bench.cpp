@@ -293,13 +293,40 @@ static bool bench_whole(bench_ctx & bc, const std::vector<llama_token> & tokens,
     return true;
 }
 
+/** @brief Restore SEQ_MAIN from the n_blocks block states at `data` with sizes `sizes`, probe position n, and compare with `ref`. */
+static bool check_blocks(bench_ctx & bc, const std::vector<llama_token> & tokens, int32_t n, int32_t b, const uint8_t * data, const std::vector<size_t> & sizes, const std::vector<float> & ref, const char * kind) {
+    llama_memory_clear(bc.mem, true);
+    for (const size_t size : sizes) {
+        if (llama_state_seq_set_data(bc.ctx, data, size, SEQ_SCRATCH) == 0) {
+            return false;
+        }
+        llama_memory_seq_cp(bc.mem, SEQ_SCRATCH, SEQ_MAIN, -1, -1);
+        llama_memory_seq_rm(bc.mem, SEQ_SCRATCH, -1, -1);
+        data += size;
+    }
+
+    const llama_pos pos_max = llama_memory_seq_pos_max(bc.mem, SEQ_MAIN);
+    std::vector<float> cur;
+    if (pos_max != n - 1 || !probe_logits(bc, tokens, n, cur)) {
+        fprintf(stderr, "%s failed: n = %d, b = %d, pos_max = %d\n", kind, n, b, pos_max);
+        emit_check(bc, kind, n, b, INFINITY, false);
+        return true;
+    }
+    float diff;
+    bool  match;
+    compare_logits(ref, cur, diff, match);
+    emit_check(bc, kind, n, b, diff, match);
+    return true;
+}
+
 /**
- * @brief Save the sequence as n / b blocks and restore it block by block (kinds block_save and block_restore).
+ * @brief Save the sequence as n / b blocks and restore it block by block (kinds block_save, block_batch_save and block_restore).
  *
  * Save: tag the block's cells with SEQ_SCRATCH (seq_cp takes a position range), save SEQ_SCRATCH, drop the tag.
+ * Batch save: one llama_state_seq_get_data_ranges() call for all blocks.
  * Restore: set_data clears its destination first, so each block goes into SEQ_SCRATCH and is then re-tagged to SEQ_MAIN.
  */
-static bool bench_block(bench_ctx & bc, const std::vector<llama_token> & tokens, int32_t n, int32_t b, int32_t rep, std::vector<std::vector<uint8_t>> & bufs, const std::vector<float> * ref) {
+static bool bench_block(bench_ctx & bc, const std::vector<llama_token> & tokens, int32_t n, int32_t b, int32_t rep, std::vector<std::vector<uint8_t>> & bufs, std::vector<uint8_t> & batch_buf, const std::vector<float> * ref) {
     const int32_t n_blocks = n / b;
     bufs.resize(n_blocks);
 
@@ -322,6 +349,30 @@ static bool bench_block(bench_ctx & bc, const std::vector<llama_token> & tokens,
     }
     const double ms_save = elapsed_ms(t0);
 
+    std::vector<llama_pos> p0(n_blocks);
+    std::vector<llama_pos> p1(n_blocks);
+    for (int32_t k = 0; k < n_blocks; ++k) {
+        p0[k] = k * b;
+        p1[k] = (k + 1) * b;
+    }
+    std::vector<size_t> sizes(n_blocks);
+
+    t0 = llama_time_us();
+    const size_t batch_bytes = llama_state_seq_get_size_ranges(bc.ctx, SEQ_MAIN, p0.data(), p1.data(), n_blocks, sizes.data());
+    batch_buf.resize(batch_bytes);
+    if (batch_bytes == 0 || llama_state_seq_get_data_ranges(bc.ctx, batch_buf.data(), batch_buf.size(), SEQ_MAIN, p0.data(), p1.data(), n_blocks) != batch_bytes) {
+        return false;
+    }
+    const double ms_batch_save = elapsed_ms(t0);
+
+    // a range state has the same layout as a scratch sequence state, so the sizes must match
+    for (int32_t k = 0; k < n_blocks; ++k) {
+        if (sizes[k] != bufs[k].size()) {
+            fprintf(stderr, "batch save size mismatch: n = %d, b = %d, block %d: %zu vs %zu\n", n, b, k, sizes[k], bufs[k].size());
+            return false;
+        }
+    }
+
     llama_memory_seq_rm(bc.mem, SEQ_MAIN, -1, -1);
 
     t0 = llama_time_us();
@@ -336,8 +387,9 @@ static bool bench_block(bench_ctx & bc, const std::vector<llama_token> & tokens,
     const double ms_restore = elapsed_ms(t0);
 
     if (rep >= 0) {
-        emit_row(bc, { "block_save",    n, b, rep, ms_save,    bytes, n_blocks });
-        emit_row(bc, { "block_restore", n, b, rep, ms_restore, bytes, n_blocks });
+        emit_row(bc, { "block_save",       n, b, rep, ms_save,       bytes,       n_blocks });
+        emit_row(bc, { "block_batch_save", n, b, rep, ms_batch_save, batch_bytes, 1        });
+        emit_row(bc, { "block_restore",    n, b, rep, ms_restore,    bytes,       n_blocks });
     }
 
     if (ref != nullptr) {
@@ -346,12 +398,14 @@ static bool bench_block(bench_ctx & bc, const std::vector<llama_token> & tokens,
         if (pos_max != n - 1 || !probe_logits(bc, tokens, n, cur)) {
             fprintf(stderr, "block restore check failed: n = %d, b = %d, pos_max = %d\n", n, b, pos_max);
             emit_check(bc, "check_block", n, b, INFINITY, false);
-            return true;
+        } else {
+            float diff;
+            bool  match;
+            compare_logits(*ref, cur, diff, match);
+            emit_check(bc, "check_block", n, b, diff, match);
         }
-        float diff;
-        bool  match;
-        compare_logits(*ref, cur, diff, match);
-        emit_check(bc, "check_block", n, b, diff, match);
+
+        return check_blocks(bc, tokens, n, b, batch_buf.data(), sizes, *ref, "check_block_batch");
     }
     return true;
 }
@@ -416,7 +470,7 @@ static bool check_tree(bench_ctx & bc, const std::vector<llama_token> & tokens, 
         if (!decode_chunked(bc, prompt, n, b)) {
             return false;
         }
-        if (!tree.save_blocks(bc.ctx, SEQ_MAIN, SEQ_SCRATCH, tree.insert(llama_tokens(prompt.begin(), prompt.begin() + n)))) {
+        if (!tree.save_blocks(bc.ctx, SEQ_MAIN, tree.insert(llama_tokens(prompt.begin(), prompt.begin() + n)))) {
             fprintf(stderr, "tree save failed: b = %d\n", b);
             return false;
         }
@@ -514,6 +568,7 @@ int main(int argc, char ** argv) {
 
     std::vector<uint8_t> whole_buf;
     std::vector<std::vector<uint8_t>> block_bufs;
+    std::vector<uint8_t> batch_buf;
 
     for (const int32_t n : args.n_list) {
         // reference logits for the probe token after a cold prefill of n tokens
@@ -540,7 +595,7 @@ int main(int argc, char ** argv) {
                 if (b > n || n % b != 0) {
                     continue;
                 }
-                if (!bench_block(bc, tokens, n, b, rep, block_bufs, check)) {
+                if (!bench_block(bc, tokens, n, b, rep, block_bufs, batch_buf, check)) {
                     fprintf(stderr, "error: block measurement failed for n = %d, b = %d\n", n, b);
                     return 1;
                 }
