@@ -12,8 +12,8 @@ Terms used below:
 
 | ID | Title | Severity | Status |
 | --- | --- | --- | --- |
-| BUG-001 | Pinned request on an empty slot never restores from the RAM prompt cache | major | found by reading |
-| BUG-002 | Pinned request with `--slot-prompt-similarity 0` never uses the RAM prompt cache | minor | found by reading |
+| BUG-001 | Pinned request on an empty slot never restores from the RAM prompt cache | major | reproduced; fixed by upstream #30866 and #28992 (open PRs) |
+| BUG-002 | Pinned request with `--slot-prompt-similarity 0` never uses the RAM prompt cache | minor | reproduced; not fixed by #30866 or #28992 |
 | BUG-003 | Saving the outgoing slot state can evict the entry that is about to be loaded | minor | found by reading |
 | BUG-004 | RAM cache entries are not matched by LoRA set | major | suspected |
 

@@ -1,6 +1,6 @@
 # Phase 1 results: measurements and block prototype
 
-Status: in progress. The block benchmark and the fit are done on both devices. The BUG-001 PR tests and the server telemetry are still open. The plan is [phase_1_measurements.md](phase_1_measurements.md).
+Status: in progress. The block benchmark, the fit, and the BUG-001 PR tests are done. The server telemetry is still open. The plan is [phase_1_measurements.md](phase_1_measurements.md).
 
 ## Summary
 
@@ -83,7 +83,24 @@ The throttled run's copy cost (0.0335 ms/token for Llama) matches the cool run's
 
 ### BUG-001 fixes
 
-Not run yet. Results for [#30866](https://github.com/ggml-org/llama.cpp/pull/30866) and [#28992](https://github.com/ggml-org/llama.cpp/pull/28992) in config E go here.
+Both upstream PRs fix BUG-001: the pinned background task now reuses 41.6% of its prompt, which is the ideal, against 0% for stock. Neither PR fixes BUG-002.
+
+Each PR's net diff was applied onto `ca89968a2`, the upstream commit Phase 0 used, so only the fix differs from the stock control. [#28992](https://github.com/ggml-org/llama.cpp/pull/28992) had two conflicts with newer upstream code. Its cache check was merged with upstream's `!task.is_stateless()` check, and its tests were kept next to the newer upstream tests. Laptop, Llama, 3 reps each, no cool-down waits. Raw results are in `bench-results/phase1/bug001/`.
+
+| Binary | Config E background hit | Background prefill tokens | RAM restores | Config A with `--slot-prompt-similarity 0`, stage 1 / 2 / 3 hit |
+| --- | --- | --- | --- | --- |
+| stock | 0.0% | 1,035 | 63 | 4.0% / 3.0% / 0.3% |
+| [#30866](https://github.com/ggml-org/llama.cpp/pull/30866) "Pin empty slot" | 41.6% | 605 | 75 | 4.0% / 3.0% / 0.3% |
+| [#28992](https://github.com/ggml-org/llama.cpp/pull/28992) "fix skipped prompt cache lookups" | 41.6% | 605 | 75 | 4.0% / 3.0% / 0.3% |
+
+The ideal hit rates are 41.6% for the background task, and 85.7% / 89.2% / 56.4% for the three stages.
+
+- **Stage 1 also gains.** In config E it goes from 81.4% to 85.7% (the ideal) with either PR. The stage-1 request sometimes also lands on an empty pinned slot.
+- **"Skipping, slot is empty" is not a fix signal.** It stays at 13-15 per run with both PRs. The line comes from the similarity loop, which still skips empty slots; the fixes act after the loop.
+- **Why #28992 does not fix BUG-002.** It asks the RAM cache for a better start (`has_better`) even when `update_cache` is false. But with similarity 0 and pinned stages, nothing ever saves a state to the RAM cache (0 RAM restores), so there is never a better entry to find. A fix must also save the outgoing state, as BUGS.md proposes.
+- **The PRs differ in scope.** #30866 is one line and covers only the empty pinned slot. #28992 also covers a pinned slot that holds a shorter prefix than a cached entry, which config E does not exercise.
+
+All runs in this session were about 45% slower than Phase 0, the stock control included (turn p50 2.6 s against 1.8 s, swap 625 ms per turn against 128 ms). The GPU had no throttle reason. The laptop was plugged in, with the "balanced" power profile. Phase 0 did not record the power profile, so the cause is not confirmed. The three binaries compare fairly with each other; their times do not compare with Phase 0.
 
 ### Cache telemetry
 
@@ -101,6 +118,7 @@ What the numbers change in the design.
 | Block save at `B` 16 costs 2x (laptop) to 6.5x (phone) a whole save | Saves should happen off the request path, or use a larger `B` for saves | 2 |
 | On the phone, recomputing an unfilled last block costs seconds per restore | Store a leaf's last partial block too, so nothing is recomputed. Then `B` is set by copy cost only, and 64-256 is better | 2 |
 | The laptop copy rate is a software limit | Pinned host memory or one copy per tensor could give a large speed-up. That is a library change, so it goes on the upstream track only with numbers | upstream |
+| Both upstream PRs fix BUG-001; neither fixes BUG-002 | Phase 2 and 3 runs can use either PR as the stock baseline for config E. BUG-002 stays open | 2, 3 |
 | Throttling slows prefill by 20% to 11x | Every laptop run starts from a cool GPU and logs its state (`run_laptop.sh`) | all |
 
 ## Changes to later phases
@@ -112,4 +130,5 @@ What the numbers change in the design.
 
 - The phone runs were not checked for throttling. The phone values are comparable with Phase 0, which was measured the same way, but they are not peak values.
 - Block storage for Gemma (SWA) and LFM2 (recurrent) is not tested. SWA masking relative to the scratch sequence, and recurrent state that cannot be split by position, are Phase 4 questions.
+- Why were all laptop orchestration runs on Nov 9 about 45% slower than Phase 0? Check the power profile ("balanced" against "performance") before the Phase 2 reruns, and record it in `meta.json`.
 - Pinned host memory for tier 1: how much of the 13 GB/s bus can the laptop reach, and what does it cost in RAM that cannot be swapped?
