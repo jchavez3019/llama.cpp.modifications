@@ -1951,6 +1951,21 @@ private:
         return output;
     }
 
+    /**
+     * @brief Binds a task to a slot and prepares the slot to run it.
+     *
+     * The caller (process_single_task()) has already selected the slot with get_available_slot(), so the slot may already hold a cached prompt. This function does not process the prompt. It only sets the slot state, and update_slots() then reuses the longest common prefix of the cached tokens and evaluates the rest.
+     *
+     * Effects on the cached prompt (KV state) of the slot:
+     *  - If the request uses a different LoRA set, the cached token list is cleared, so no prefix is reused. The only exception is a change from no LoRA (or only aLoRAs) to only aLoRAs, because an aLoRA does not change the KV values of the tokens before its invocation tokens.
+     *  - TTS, realtime transcription, and realtime conversation tasks always clear the slot KV state.
+     *
+     * The function also selects the active aLoRA, checks the prompt tokens, and creates the sampler. On success it moves the task into slot.task and sets the slot state (STARTED, or WAIT_OTHER for a child task).
+     *
+     * @param slot The slot that runs the task. It must not be processing another task.
+     * @param task The task to run. On success it is moved into slot.task. On failure it is not moved.
+     * @return True if the slot is launched. False if the request is not valid (several aLoRAs, invalid tokens, bad sampler parameters) or TTS / audio setup fails. An error has then already been sent to the client, and the caller drops the task.
+     */
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
@@ -3008,7 +3023,23 @@ private:
         return n_read;
     }
 
-    // returns false to decline the task, it is offered again after the decode is done
+    /**
+     * @brief Handles one task taken from the server task queue.
+     *
+     * The queue calls this function for each new task (see server_queue::process_new_tasks()). It runs on the main loop thread, or on the queue worker thread while the main thread runs an encode or decode (see server_queue::yield_to_queue()).
+     *
+     * Generation tasks (completion, infill, embedding, rerank, TTS, decision, realtime) are assigned to a slot:
+     *  - get_available_slot() selects the slot by id_slot, by prompt similarity, or by LRU. It can also swap the KV state of the slot with an entry of the RAM prompt cache.
+     *  - If no slot is free, or the requested slot is busy, the task is deferred. The queue offers it again when a slot is released.
+     *  - Else the task is launched on the slot. The prompt is processed later, in update_slots().
+     *  - With --cache-idle-slots, all other idle slots are then saved to the RAM prompt cache. With a unified KV cache, they are also cleared from the KV cache.
+     *
+     * Other task types (cancel, control, metrics, slot save / restore / erase, LoRA get / set) run immediately and send their result to queue_results.
+     *
+     * @param task        The task to handle. When the function returns false, it does not consume the task, so the caller can keep it.
+     * @param is_yielding True when the call comes from the queue worker thread during an encode or decode. Then only tasks that read the server state (metrics, slot get) are safe to run.
+     * @return False if the task is declined because is_yielding is true and the task changes the server state. The queue then sets the task aside and offers it again after the decode. True in all other cases, also when the task is deferred, fails, or is dropped.
+     */
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
@@ -3041,6 +3072,7 @@ private:
 
                     const int id_task = task.id;
 
+                    // Select the slot for this task. If the slot holds a dissimilar prompt, this also saves the old prompt to the RAM prompt cache and loads the cached prompt that best matches the new one.
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -3079,6 +3111,9 @@ private:
                         break; // drop the task
                     }
 
+                    // Idle-slot caching: copy the KV state of every idle slot to the RAM prompt cache, so a later request with the same prefix can restore it into any slot.
+                    // With a unified KV cache, all slots share one pool of KV cells. Clearing the idle slots gives the new task room in that pool. Without a unified KV cache, each slot owns its cells, so clearing frees nothing and the KV state stays.
+                    // This runs on every launched task, not after a timeout. One new task moves all idle slots out of the KV cache.
                     if (params_base.cache_idle_slots) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {

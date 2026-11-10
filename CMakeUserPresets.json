@@ -1,0 +1,47 @@
+{
+  "version": 4,
+  "configurePresets": [
+    {
+      "name": "laptop-cuda-release",
+      "displayName": "Laptop: CUDA (RTX 3060, sm_86), Release",
+      "inherits": [ "base", "release" ],
+      "cacheVariables": {
+        "GGML_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "86",
+        "CMAKE_CUDA_COMPILER": "/usr/local/cuda-12.6/bin/nvcc",
+        "LLAMA_BUILD_TESTS": "OFF",
+        "LLAMA_BUILD_EXAMPLES": "OFF"
+      }
+    },
+    {
+      "name": "android-arm64-release",
+      "displayName": "Pixel Fold: Android arm64 (Tensor G2, CPU), Release",
+      "inherits": [ "base", "release" ],
+      "toolchainFile": "$env{HOME}/Android/Sdk/ndk/26.3.11579264/build/cmake/android.toolchain.cmake",
+      "cacheVariables": {
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-28",
+        "GGML_NATIVE": "OFF",
+        "GGML_CPU_ARM_ARCH": "armv8.2-a+dotprod+fp16",
+        "GGML_OPENMP": "OFF",
+        "GGML_LLAMAFILE": "OFF",
+        "LLAMA_OPENSSL": "OFF",
+        "BUILD_SHARED_LIBS": "OFF",
+        "LLAMA_BUILD_TESTS": "OFF",
+        "LLAMA_BUILD_EXAMPLES": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "laptop-cuda-release",
+      "configurePreset": "laptop-cuda-release",
+      "targets": [ "llama-server", "llama-bench", "llama-kv-block-bench" ]
+    },
+    {
+      "name": "android-arm64-release",
+      "configurePreset": "android-arm64-release",
+      "targets": [ "llama-server", "llama-bench", "llama-kv-block-bench" ]
+    }
+  ]
+}

@@ -73,3 +73,6 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# fork-only: radix tree KV cache measurements (docs/radix_tree_kv_cache)
+add_subdirectory(bench/kv-block-bench)

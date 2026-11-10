@@ -1,0 +1,4 @@
+requests
+pytest
+nvidia-ml-py
+perfetto

@@ -1,0 +1,12 @@
+name: llama-orch-bench
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - requests
+  - pytest
+  - ninja
+  - pip
+  - pip:
+      - nvidia-ml-py
+      - perfetto
