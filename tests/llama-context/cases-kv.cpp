@@ -717,7 +717,7 @@ struct case_state_restore_fragmented : ctx_test {
  * Given: a prompt on seq 0, in ctx and in ctx_keep
  * When:  seq 0 is saved as position ranges with llama_state_seq_get_data_ranges(), removed, and restored range by range
  * Then:  one range over all positions is the same blob as llama_state_seq_get_data(), and seq 0 continues as in ctx_keep
- *        recurrent and hybrid memory refuses ranges
+ *        a buffer that is too small fails the save, and recurrent and hybrid memory refuses ranges
  */
 struct case_state_ranges : ctx_test {
     const char * name() const override { return "ranges"; }
@@ -779,24 +779,39 @@ struct case_state_ranges : ctx_test {
         }
         const llama_pos p_all0 = 0;
         const llama_pos p_all1 = n_tokens;
-        std::vector<uint8_t> whole_range(whole.size());
-        CTX_REQUIRE(llama_state_seq_get_data_ranges(ctx.get(), whole_range.data(), whole_range.size(), 0, &p_all0, &p_all1, 1) == whole.size(),
+        size_t whole_size = 0;
+        CTX_REQUIRE(llama_state_seq_get_size_ranges(ctx.get(), 0, &p_all0, &p_all1, 1, &whole_size) == whole.size(),
                 "a range over all positions has a different size than the sequence state");
+        std::vector<uint8_t> whole_range(whole_size);
+        uint8_t * whole_dst = whole_range.data();
+        CTX_REQUIRE(llama_state_seq_get_data_ranges(ctx.get(), &whole_dst, &whole_size, 0, &p_all0, &p_all1, 1) == whole.size(),
+                "a range over all positions wrote a different size than the sequence state");
         CTX_REQUIRE(blobs_equal(whole, whole_range), "a range over all positions is not the same blob as the sequence state");
 
-        std::vector<uint8_t> data(size);
-        CTX_REQUIRE(llama_state_seq_get_data_ranges(ctx.get(), data.data(), data.size(), 0, p0.data(), p1.data(), n_ranges) == size,
+        std::vector<std::vector<uint8_t>> data(n_ranges);
+        std::vector<uint8_t *> dst(n_ranges);
+        for (int32_t i = 0; i < n_ranges; ++i) {
+            data[i].resize(sizes[i]);
+            dst[i] = data[i].data();
+        }
+        CTX_REQUIRE(llama_state_seq_get_data_ranges(ctx.get(), dst.data(), sizes.data(), 0, p0.data(), p1.data(), n_ranges) == size,
                 "the range save wrote a different size than reported");
+
+        // a buffer one byte too small must fail, not spill into the next range
+        std::vector<size_t> sizes_short = sizes;
+        sizes_short[0] -= 1;
+        CTX_REQUIRE(llama_state_seq_get_data_ranges(ctx.get(), dst.data(), sizes_short.data(), 0, p0.data(), p1.data(), n_ranges) == 0,
+                "a range save into a too small buffer did not fail");
+        CTX_REQUIRE(llama_state_seq_get_data_ranges(ctx.get(), dst.data(), sizes.data(), 0, p0.data(), p1.data(), n_ranges) == size,
+                "the range save failed after a failed save");
 
         // set_data clears its target sequence, so each range goes through seq 1
         llama_memory_seq_rm(mem, 0, -1, -1);
-        size_t offset = 0;
         for (int32_t i = 0; i < n_ranges; ++i) {
-            CTX_REQUIRE(llama_state_seq_set_data(ctx.get(), data.data() + offset, sizes[i], 1) == sizes[i],
+            CTX_REQUIRE(llama_state_seq_set_data(ctx.get(), data[i].data(), data[i].size(), 1) == sizes[i],
                     "failed to restore range " + std::to_string(i));
             llama_memory_seq_cp(mem, 1, 0, -1, -1);
             llama_memory_seq_rm(mem, 1, -1, -1);
-            offset += sizes[i];
         }
         CTX_REQUIRE(llama_memory_seq_pos_max(mem, 0) == n_tokens - 1, "the restored sequence does not end at the last position");
 

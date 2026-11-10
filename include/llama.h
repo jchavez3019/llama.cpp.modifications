@@ -964,13 +964,14 @@ extern "C" {
                          int32_t   n_ranges,
                           size_t * sizes);
 
-    // Copy the ranges into dst one after the other. Each range loads with llama_state_seq_set_data
+    // Copy range i into dst[i], which must have exactly sizes[i] bytes (from llama_state_seq_get_size_ranges)
+    // Each range loads with llama_state_seq_set_data
     // Reads the tensor data of all ranges in one batch, which is faster than one llama_state_seq_get_data call per range
     // Returns the total size written, or 0 on error
     LLAMA_API size_t llama_state_seq_get_data_ranges(
             struct llama_context * ctx,
-                         uint8_t * dst,
-                          size_t   size,
+                 uint8_t * const * dst,
+                    const size_t * sizes,
                     llama_seq_id   seq_id,
                const llama_pos   * p0,
                const llama_pos   * p1,

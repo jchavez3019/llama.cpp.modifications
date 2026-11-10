@@ -13,6 +13,10 @@
 #include <string>
 #include <vector>
 
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
 static const llama_seq_id SEQ_MAIN    = 0;
 static const llama_seq_id SEQ_SCRATCH = 1;
 static const uint32_t     TOKEN_SEED  = 1234;
@@ -293,16 +297,15 @@ static bool bench_whole(bench_ctx & bc, const std::vector<llama_token> & tokens,
     return true;
 }
 
-/** @brief Restore SEQ_MAIN from the n_blocks block states at `data` with sizes `sizes`, probe position n, and compare with `ref`. */
-static bool check_blocks(bench_ctx & bc, const std::vector<llama_token> & tokens, int32_t n, int32_t b, const uint8_t * data, const std::vector<size_t> & sizes, const std::vector<float> & ref, const char * kind) {
+/** @brief Restore SEQ_MAIN from the block states `bufs`, probe position n, and compare with `ref`. */
+static bool check_blocks(bench_ctx & bc, const std::vector<llama_token> & tokens, int32_t n, int32_t b, const std::vector<std::vector<uint8_t>> & bufs, const std::vector<float> & ref, const char * kind) {
     llama_memory_clear(bc.mem, true);
-    for (const size_t size : sizes) {
-        if (llama_state_seq_set_data(bc.ctx, data, size, SEQ_SCRATCH) == 0) {
+    for (const auto & buf : bufs) {
+        if (llama_state_seq_set_data(bc.ctx, buf.data(), buf.size(), SEQ_SCRATCH) == 0) {
             return false;
         }
         llama_memory_seq_cp(bc.mem, SEQ_SCRATCH, SEQ_MAIN, -1, -1);
         llama_memory_seq_rm(bc.mem, SEQ_SCRATCH, -1, -1);
-        data += size;
     }
 
     const llama_pos pos_max = llama_memory_seq_pos_max(bc.mem, SEQ_MAIN);
@@ -326,7 +329,7 @@ static bool check_blocks(bench_ctx & bc, const std::vector<llama_token> & tokens
  * Batch save: one llama_state_seq_get_data_ranges() call for all blocks.
  * Restore: set_data clears its destination first, so each block goes into SEQ_SCRATCH and is then re-tagged to SEQ_MAIN.
  */
-static bool bench_block(bench_ctx & bc, const std::vector<llama_token> & tokens, int32_t n, int32_t b, int32_t rep, std::vector<std::vector<uint8_t>> & bufs, std::vector<uint8_t> & batch_buf, const std::vector<float> * ref) {
+static bool bench_block(bench_ctx & bc, const std::vector<llama_token> & tokens, int32_t n, int32_t b, int32_t rep, std::vector<std::vector<uint8_t>> & bufs, std::vector<std::vector<uint8_t>> & batch_bufs, const std::vector<float> * ref) {
     const int32_t n_blocks = n / b;
     bufs.resize(n_blocks);
 
@@ -335,12 +338,13 @@ static bool bench_block(bench_ctx & bc, const std::vector<llama_token> & tokens,
         return false;
     }
 
+    // both saves put each block in a new buffer, as the server does
     size_t bytes = 0;
     int64_t t0 = llama_time_us();
     for (int32_t k = 0; k < n_blocks; ++k) {
         llama_memory_seq_cp(bc.mem, SEQ_MAIN, SEQ_SCRATCH, k * b, (k + 1) * b);
         const size_t size = llama_state_seq_get_size(bc.ctx, SEQ_SCRATCH);
-        bufs[k].resize(size);
+        bufs[k] = std::vector<uint8_t>(size);
         if (llama_state_seq_get_data(bc.ctx, bufs[k].data(), size, SEQ_SCRATCH) != size) {
             return false;
         }
@@ -356,11 +360,17 @@ static bool bench_block(bench_ctx & bc, const std::vector<llama_token> & tokens,
         p1[k] = (k + 1) * b;
     }
     std::vector<size_t> sizes(n_blocks);
+    std::vector<uint8_t *> dst(n_blocks);
+    batch_bufs.clear();
+    batch_bufs.resize(n_blocks);
 
     t0 = llama_time_us();
     const size_t batch_bytes = llama_state_seq_get_size_ranges(bc.ctx, SEQ_MAIN, p0.data(), p1.data(), n_blocks, sizes.data());
-    batch_buf.resize(batch_bytes);
-    if (batch_bytes == 0 || llama_state_seq_get_data_ranges(bc.ctx, batch_buf.data(), batch_buf.size(), SEQ_MAIN, p0.data(), p1.data(), n_blocks) != batch_bytes) {
+    for (int32_t k = 0; k < n_blocks; ++k) {
+        batch_bufs[k].resize(sizes[k]);
+        dst[k] = batch_bufs[k].data();
+    }
+    if (batch_bytes == 0 || llama_state_seq_get_data_ranges(bc.ctx, dst.data(), sizes.data(), SEQ_MAIN, p0.data(), p1.data(), n_blocks) != batch_bytes) {
         return false;
     }
     const double ms_batch_save = elapsed_ms(t0);
@@ -405,7 +415,7 @@ static bool bench_block(bench_ctx & bc, const std::vector<llama_token> & tokens,
             emit_check(bc, "check_block", n, b, diff, match);
         }
 
-        return check_blocks(bc, tokens, n, b, batch_buf.data(), sizes, *ref, "check_block_batch");
+        return check_blocks(bc, tokens, n, b, batch_bufs, *ref, "check_block_batch");
     }
     return true;
 }
@@ -497,6 +507,11 @@ static bool check_tree(bench_ctx & bc, const std::vector<llama_token> & tokens, 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
+#ifdef __GLIBC__
+    // a fixed threshold keeps each block buffer on new pages, as in a growing prompt tree; by default glibc reuses freed memory and hides the page faults
+    mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+#endif
+
     bench_args args;
     if (!parse_args(argc, argv, args)) {
         print_usage(argv[0]);
@@ -568,7 +583,7 @@ int main(int argc, char ** argv) {
 
     std::vector<uint8_t> whole_buf;
     std::vector<std::vector<uint8_t>> block_bufs;
-    std::vector<uint8_t> batch_buf;
+    std::vector<std::vector<uint8_t>> batch_bufs;
 
     for (const int32_t n : args.n_list) {
         // reference logits for the probe token after a cold prefill of n tokens
@@ -595,7 +610,7 @@ int main(int argc, char ** argv) {
                 if (b > n || n % b != 0) {
                     continue;
                 }
-                if (!bench_block(bc, tokens, n, b, rep, block_bufs, batch_buf, check)) {
+                if (!bench_block(bc, tokens, n, b, rep, block_bufs, batch_bufs, check)) {
                     fprintf(stderr, "error: block measurement failed for n = %d, b = %d\n", n, b);
                     return 1;
                 }

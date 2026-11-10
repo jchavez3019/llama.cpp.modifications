@@ -172,7 +172,7 @@ struct llama_context {
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
     size_t state_seq_get_size_ranges(llama_seq_id seq_id, const llama_pos * p0, const llama_pos * p1, int32_t n_ranges, size_t * sizes);
-    size_t state_seq_get_data_ranges(llama_seq_id seq_id, const llama_pos * p0, const llama_pos * p1, int32_t n_ranges, uint8_t * dst, size_t size);
+    size_t state_seq_get_data_ranges(llama_seq_id seq_id, const llama_pos * p0, const llama_pos * p1, int32_t n_ranges, uint8_t * const * dst, const size_t * sizes);
 
     bool state_load_file(
             const char * filepath,

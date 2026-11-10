@@ -110,7 +110,7 @@ struct server_prompt_tree {
     /**
      * @brief Saves the K/V of `blocks` from a sequence into the tree.
      *
-     * All blocks are saved with one llama_state_seq_get_data_ranges() call, then split into one buffer per block.
+     * All blocks are saved with one llama_state_seq_get_data_ranges() call, straight into one buffer per block.
      *
      * @param ctx The context that holds the sequence.
      * @param seq_id The sequence that holds the positions of all blocks.

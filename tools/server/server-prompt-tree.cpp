@@ -218,16 +218,19 @@ bool server_prompt_tree::save_blocks(llama_context * ctx, llama_seq_id seq_id, c
         return false;
     }
 
-    // one buffer for all blocks, so the K/V of all blocks is read from the device in one batch
-    std::unique_ptr<uint8_t[]> buf(new uint8_t[size]);
-    if (llama_state_seq_get_data_ranges(ctx, buf.get(), size, seq_id, p0.data(), p1.data(), n_blocks) != size) {
+    // the library writes each block straight into its final buffer, so new memory is touched only once
+    std::vector<std::vector<uint8_t>> data(n_blocks);
+    std::vector<uint8_t *> dst(n_blocks);
+    for (int32_t i = 0; i < n_blocks; ++i) {
+        data[i].resize(sizes[i]);
+        dst[i] = data[i].data();
+    }
+    if (llama_state_seq_get_data_ranges(ctx, dst.data(), sizes.data(), seq_id, p0.data(), p1.data(), n_blocks) != size) {
         return false;
     }
 
-    size_t offset = 0;
     for (int32_t i = 0; i < n_blocks; ++i) {
-        set_data(blocks[i], std::vector<uint8_t>(buf.get() + offset, buf.get() + offset + sizes[i]));
-        offset += sizes[i];
+        set_data(blocks[i], std::move(data[i]));
     }
 
     return true;

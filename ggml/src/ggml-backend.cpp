@@ -750,6 +750,67 @@ void ggml_backend_tensor_get_n(const struct ggml_tensor * const * tensors, void 
     }
 }
 
+void ggml_backend_tensor_get_n_ptr(const struct ggml_tensor * const * tensors, void * const * data,
+        const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+    if (n_tensors == 0) {
+        return;
+    }
+
+    ggml_backend_buffer_t buf = NULL;
+    bool same_buft = true;
+
+    for (size_t i = 0; i < n_tensors; i++) {
+        GGML_ASSERT(tensors[i] != NULL);
+        ggml_backend_buffer_t tensor_buf = tensors[i]->view_src ? tensors[i]->view_src->buffer : tensors[i]->buffer;
+        GGML_ASSERT(tensor_buf != NULL && "tensor buffer not set");
+        GGML_ASSERT(tensors[i]->data != NULL && "tensor not allocated");
+        GGML_ASSERT(offsets[i] + sizes[i] <= ggml_nbytes(tensors[i]) && "tensor read out of bounds");
+
+        if (buf == NULL) {
+            buf = tensor_buf;
+        } else if (buf->buft != tensor_buf->buft) {
+            same_buft = false;
+        }
+    }
+
+    if (same_buft && buf->iface.get_tensor_n != NULL) {
+        buf->iface.get_tensor_n(buf, tensors, data, offsets, sizes, n_tensors);
+        return;
+    }
+
+    if (!same_buft) {
+        std::vector<std::vector<size_t>> groups;
+        ggml_backend_tensor_buft_groups(n_tensors, [&](size_t i) {
+            return tensors[i]->view_src ? tensors[i]->view_src->buffer : tensors[i]->buffer;
+        }, groups);
+
+        for (const auto & group : groups) {
+            std::vector<const ggml_tensor *> g_tensors;
+            std::vector<void *> g_data;
+            std::vector<size_t> g_offsets;
+            std::vector<size_t> g_sizes;
+            g_tensors.reserve(group.size());
+            g_data.reserve(group.size());
+            g_offsets.reserve(group.size());
+            g_sizes.reserve(group.size());
+
+            for (size_t i : group) {
+                g_tensors.push_back(tensors[i]);
+                g_data.push_back(data[i]);
+                g_offsets.push_back(offsets[i]);
+                g_sizes.push_back(sizes[i]);
+            }
+
+            ggml_backend_tensor_get_n_ptr(g_tensors.data(), g_data.data(), g_offsets.data(), g_sizes.data(), g_tensors.size());
+        }
+        return;
+    }
+
+    for (size_t i = 0; i < n_tensors; i++) {
+        ggml_backend_tensor_get(tensors[i], data[i], offsets[i], sizes[i]);
+    }
+}
+
 void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;

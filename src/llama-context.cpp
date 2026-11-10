@@ -3197,6 +3197,89 @@ private:
     std::vector<write_info> winfos;
 };
 
+// writes consecutive states into one buffer each, and reads the tensor data of all of them in one batch
+class llama_io_write_host_n : public llama_io_write_i {
+public:
+    llama_io_write_host_n(uint8_t * const * dsts, const size_t * sizes, int32_t n_bufs) : dsts(dsts), sizes(sizes), n_bufs(n_bufs) {}
+
+    ~llama_io_write_host_n() {
+        if (winfos.empty()) {
+            return;
+        }
+
+        std::vector<const ggml_tensor *> tensors;
+        std::vector<void *> ptrs;
+        std::vector<size_t> offsets;
+        std::vector<size_t> n_bytes_read;
+        tensors.reserve(winfos.size());
+        ptrs.reserve(winfos.size());
+        offsets.reserve(winfos.size());
+        n_bytes_read.reserve(winfos.size());
+
+        for (const auto & winfo : winfos) {
+            tensors.push_back(winfo.tensor);
+            ptrs.push_back(winfo.ptr);
+            offsets.push_back(winfo.offset);
+            n_bytes_read.push_back(winfo.size);
+        }
+
+        ggml_backend_tensor_get_n_ptr(tensors.data(), ptrs.data(), offsets.data(), n_bytes_read.data(), winfos.size());
+    }
+
+    void write(const void * src, size_t size) override {
+        uint8_t * dst = reserve(size);
+        if (size > 0) {
+            memcpy(dst, src, size);
+        }
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        // save the write for later during destruction
+        winfos.push_back({tensor, reserve(size), size, offset});
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+private:
+    // a write never spans two buffers: each buffer holds exactly one state
+    uint8_t * reserve(size_t size) {
+        while (n_left == 0 && i_buf + 1 < n_bufs) {
+            ++i_buf;
+            ptr    = dsts[i_buf];
+            n_left = sizes[i_buf];
+        }
+        if (size > n_left) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        uint8_t * res = ptr;
+        ptr          += size;
+        n_left       -= size;
+        size_written += size;
+        return res;
+    }
+
+    uint8_t * const * dsts;
+    const size_t    * sizes;
+    const int32_t     n_bufs;
+
+    int32_t   i_buf  = -1;
+    uint8_t * ptr    = nullptr;
+    size_t    n_left = 0;
+
+    size_t size_written = 0;
+
+    struct write_info {
+        ggml_tensor * tensor;
+        uint8_t * ptr;
+        size_t size;
+        size_t offset;
+    };
+    std::vector<write_info> winfos;
+};
+
 class llama_io_read_host : public llama_io_read_i {
 public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), base_ptr(p), buf_size(len) {}
@@ -3753,11 +3836,20 @@ size_t llama_context::state_seq_get_size_ranges(llama_seq_id seq_id, const llama
     }
 }
 
-size_t llama_context::state_seq_get_data_ranges(llama_seq_id seq_id, const llama_pos * p0, const llama_pos * p1, int32_t n_ranges, uint8_t * dst, size_t size) {
+size_t llama_context::state_seq_get_data_ranges(llama_seq_id seq_id, const llama_pos * p0, const llama_pos * p1, int32_t n_ranges, uint8_t * const * dst, const size_t * sizes) {
     // one io for all ranges, so its destructor reads all tensor data in one batch
-    llama_io_write_host io(dst, size);
+    llama_io_write_host_n io(dst, sizes, n_ranges);
     try {
-        return state_seq_write_ranges(io, seq_id, p0, p1, n_ranges, nullptr);
+        std::vector<size_t> n_written(std::max(n_ranges, 0));
+        const size_t n_total = state_seq_write_ranges(io, seq_id, p0, p1, n_ranges, n_written.data());
+
+        // a range that does not fill its buffer exactly puts the next range in the wrong buffer
+        for (int32_t i = 0; i < n_ranges; ++i) {
+            if (n_written[i] != sizes[i]) {
+                throw std::runtime_error("range " + std::to_string(i) + " has a different size than its buffer");
+            }
+        }
+        return n_total;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
@@ -4905,10 +4997,10 @@ size_t llama_state_seq_get_size_ranges(llama_context * ctx, llama_seq_id seq_id,
     return ctx->state_seq_get_size_ranges(seq_id, p0, p1, n_ranges, sizes);
 }
 
-size_t llama_state_seq_get_data_ranges(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, const llama_pos * p0, const llama_pos * p1, int32_t n_ranges) {
+size_t llama_state_seq_get_data_ranges(llama_context * ctx, uint8_t * const * dst, const size_t * sizes, llama_seq_id seq_id, const llama_pos * p0, const llama_pos * p1, int32_t n_ranges) {
     ctx->synchronize();
 
-    return ctx->state_seq_get_data_ranges(seq_id, p0, p1, n_ranges, dst, size);
+    return ctx->state_seq_get_data_ranges(seq_id, p0, p1, n_ranges, dst, sizes);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

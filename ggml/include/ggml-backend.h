@@ -98,6 +98,8 @@ extern "C" {
     GGML_API void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
     GGML_API void ggml_backend_tensor_set_n (      struct ggml_tensor * const * tensors, const void * data, const size_t * offsets, const size_t * sizes, const size_t * data_offsets, size_t n_tensors);
     GGML_API void ggml_backend_tensor_get_n (const struct ggml_tensor * const * tensors,       void * data, const size_t * offsets, const size_t * sizes, const size_t * data_offsets, size_t n_tensors);
+    // same as ggml_backend_tensor_get_n, with one destination pointer per tensor instead of one base and offsets
+    GGML_API void ggml_backend_tensor_get_n_ptr(const struct ggml_tensor * const * tensors, void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors);
     GGML_API void ggml_backend_tensor_memset(      struct ggml_tensor * tensor,     uint8_t value, size_t offset, size_t size);
 
     GGML_API void ggml_backend_synchronize(ggml_backend_t backend);
