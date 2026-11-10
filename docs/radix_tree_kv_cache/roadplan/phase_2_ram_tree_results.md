@@ -4,7 +4,7 @@ Status: done, Llama only, laptop and phone. The plan is [phase_2_ram_tree.md](ph
 
 ## Summary
 
-The tree fixes the largest Phase 0 loss. With the stock flags plus `--cache-tree` (F-tree), stages 1 and 2 reuse the ideal 85-89% instead of 3-6%. The phone turn drops from 45.3 s to 20.1 s, and phone energy per turn halves. Config D is no worse than stock D, and restores are bit-identical. Three of the four exit criteria are met. The greedy-output criterion is narrowly missed on a sample of 24 requests.
+The tree fixes the largest Phase 0 loss. With the stock flags plus `--cache-tree` (F-tree), stages 1 and 2 reuse the ideal 85-89% instead of 3-6%. The phone turn drops from 45.3 s to 20.1 s, and phone energy per turn halves. Config D is no worse than stock D, and restores are bit-identical. All four exit criteria are met. For the greedy-output criterion, F-tree differs from a no-cache run slightly more often than C, but on 102 requests the gap is not significant.
 
 A batched block save (`llama_state_seq_get_data_ranges`) was added after the first measurements. It writes each block straight into its own buffer and cuts the server save cost by 13% (laptop) and 10% (phone). The rest of the save cost is mostly new memory. Block restores stay one call per block, so `B` stays at 64.
 
@@ -16,7 +16,7 @@ Each criterion from the plan, checked on both devices.
 | --- | --- | --- |
 | F-tree stage 1 and 2 hit within 2 points of the ideal | met | Exactly the ideal on both devices (85.7 / 89.2% laptop, 84.9 / 88.0% phone) |
 | D-tree hit rates and turn time no worse than D | met | Same hits as D. Turn 2109 vs 2112 ms (laptop), 31.3 vs 36.5 s (phone) |
-| `check_tree_*` bit-identical; F-tree greedy outputs differ from no cache no more often than C's | partly | Bit-identical on both devices. F-tree differs on 13 of 24 requests, C on 10 of 24 (laptop, one run) |
+| `check_tree_*` bit-identical; F-tree greedy outputs differ from no cache no more often than C's | met | Bit-identical on both devices. Over 34 turns (102 requests, laptop), F-tree differs on 47 and C on 42. Paired: 12 differ only with F-tree, 7 only with C, exact sign test p = 0.36, so not significant. Stage 1 never differs |
 | Restore time per turn below A's swap time | met | 37 vs 131 ms (laptop), 12 vs 85 ms (phone) |
 
 ## Numbers
@@ -110,7 +110,7 @@ What the numbers alone do not say.
 - **CUDA's gather kernel needs one compact destination.** With one shared buffer, CUDA pins it and reads all blocks with one kernel. With one buffer per block, the buffers are far apart, so CUDA falls back to one `cudaMemcpyAsync` per read (about 1,900 per turn, about 12 µs each). A block pool (large slabs cut into block-sized slots, with evicted slots reused) would remove both the page faults and the fallback. The best case is about 40 ms per turn on the laptop (2.5% of a turn) and about 10 ms on the phone, which does not justify a new allocator in the tree now.
 - **Per-block restore cost has no easy fix.** On CUDA, each restore block makes 32 `cudaMemcpyAsync` calls from pageable memory at about 5 µs each (Nsight Systems). Uploads have no gather kernel, so one shared reader would not remove them. On the phone the cost per block is cell bookkeeping (clear, find cells, scratch copy) of about 0.1 ms, which is small against a 20 s turn.
 - **`B` 16 has lost its main reason.** Phase 1 picked `B` 16 for the phone because it assumed that the tokens after the last full block are recomputed. The leaf's short last block already saves them. What `B` still changes is per-call overhead (favours large blocks) and duplicate storage at branch points (up to `B`-1 tokens per branch, 2 MiB at `B` 64).
-- **Greedy outputs drift with any cache.** Stock C matches a no-cache run on only 14 of 24 requests. K/V computed in prefill batches of other sizes round differently on the GPU, and the drift grows over a generation. A strict "same output" test is not valid for prompt caches on the GPU; the bit-identical bench check with matched batch shapes is.
+- **Greedy outputs drift with any cache.** Stock C matches a no-cache run on only 60 of 102 requests. F-tree differs on 47, which is not significantly more (see "Exit criteria"). K/V computed in prefill batches of other sizes round differently on the GPU, and the drift grows over a generation. A strict "same output" test is not valid for prompt caches on the GPU; the bit-identical bench check with matched batch shapes is.
 
 ## Changes to later phases
 
@@ -124,7 +124,6 @@ Plan or design changes that follow from these results.
 
 Questions this phase raised and did not answer.
 
-- Does F-tree really diverge from the no-cache run more often than C (13 vs 10 of 24), or is that noise? More requests would settle it.
 - Phone D-tree is 5 s faster than D with the same hit rates. Thermal state differed between the runs (no cooling waits), so this may not be real.
 - Partial saves for prompts larger than the limit (config D stage 3) need an eviction policy that does not thrash.
 - Does a block pool pay off for larger models? Only the 1B model was measured. With grouped-query attention, K/V size grows more slowly than compute (Llama 3.1 8B has 4x the K/V per token and about 8x the compute), so the save share of a turn is expected to be smaller, not larger.
