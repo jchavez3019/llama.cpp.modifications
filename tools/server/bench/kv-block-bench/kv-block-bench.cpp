@@ -19,6 +19,7 @@
 
 static const llama_seq_id SEQ_MAIN    = 0;
 static const llama_seq_id SEQ_SCRATCH = 1;
+static const llama_seq_id SEQ_PARKED  = 2;
 static const uint32_t     TOKEN_SEED  = 1234;
 
 /** @brief Command line options. */
@@ -420,10 +421,10 @@ static bool bench_block(bench_ctx & bc, const std::vector<llama_token> & tokens,
     return true;
 }
 
-/** @brief Decode tokens[0, n) in chunks of b. Prompts that share a prefix then get the same batch shapes, so the shared K/V are bit-identical. */
-static bool decode_chunked(bench_ctx & bc, const std::vector<llama_token> & tokens, int32_t n, int32_t b) {
-    for (int32_t p0 = 0; p0 < n; p0 += b) {
-        if (!decode_range(bc, tokens, p0, std::min(b, n - p0), SEQ_MAIN)) {
+/** @brief Decode tokens[p_from, n) into `seq` in chunks of b, with p_from a multiple of b. Prompts that share a prefix then get the same batch shapes, so the shared K/V are bit-identical. */
+static bool decode_chunked(bench_ctx & bc, const std::vector<llama_token> & tokens, int32_t n, int32_t b, llama_seq_id seq = SEQ_MAIN, int32_t p_from = 0) {
+    for (int32_t p0 = p_from; p0 < n; p0 += b) {
+        if (!decode_range(bc, tokens, p0, std::min(b, n - p0), seq)) {
             return false;
         }
     }
@@ -452,6 +453,46 @@ static void check_tree_case(bench_ctx & bc, server_prompt_tree & tree, const std
     emit_check(bc, kind, n, b, diff, match);
 }
 
+/** @brief Probe position n of SEQ_MAIN, compare with `ref`, and emit the result. `ok` is false if the setup already failed. */
+static void check_probe(bench_ctx & bc, const std::vector<llama_token> & prompt, int32_t n, int32_t b, const std::vector<float> & ref, const char * kind, bool ok) {
+    std::vector<float> cur;
+    if (!ok || llama_memory_seq_pos_max(bc.mem, SEQ_MAIN) != n - 1 || !probe_logits(bc, prompt, n, cur)) {
+        fprintf(stderr, "%s failed: n = %d, b = %d\n", kind, n, b);
+        emit_check(bc, kind, n, b, INFINITY, false);
+        return;
+    }
+    float diff;
+    bool  match;
+    compare_logits(ref, cur, diff, match);
+    emit_check(bc, kind, n, b, diff, match);
+}
+
+/**
+ * @brief Check attach of a parked sequence by tag only (kinds check_attach_*).
+ *
+ * Prompt 1 stays in SEQ_PARKED, as a parked tree leaf. Then:
+ * - prefix: SEQ_MAIN attaches the first block of prompt 1 with seq_cp, which prompt 2 shares, and prefills the rest of prompt 2
+ * - parked: SEQ_MAIN is removed, then attaches all of prompt 1; the cells must still be there, because SEQ_PARKED tags them
+ *
+ * Prompt 2's own cells take other cell indices than in the reference, so this also checks that the cell layout does not change the result.
+ */
+static bool check_attach(bench_ctx & bc, const std::vector<llama_token> & prompt1, int32_t n1, const std::vector<llama_token> & prompt2, int32_t n2, int32_t b, const std::vector<float> & ref1, const std::vector<float> & ref2) {
+    llama_memory_clear(bc.mem, true);
+    if (!decode_chunked(bc, prompt1, n1, b, SEQ_PARKED)) {
+        return false;
+    }
+
+    llama_memory_seq_cp(bc.mem, SEQ_PARKED, SEQ_MAIN, 0, b);
+    const bool ok_prefix = decode_chunked(bc, prompt2, n2, b, SEQ_MAIN, b);
+    check_probe(bc, prompt2, n2, b, ref2, "check_attach_prefix", ok_prefix);
+
+    llama_memory_seq_rm(bc.mem, SEQ_MAIN, -1, -1);
+    const bool ok_parked = llama_memory_seq_pos_min(bc.mem, SEQ_PARKED) == 0 && llama_memory_seq_pos_max(bc.mem, SEQ_PARKED) == n1 - 1;
+    llama_memory_seq_cp(bc.mem, SEQ_PARKED, SEQ_MAIN, 0, n1);
+    check_probe(bc, prompt1, n1, b, ref1, "check_attach_parked", ok_parked);
+    return true;
+}
+
 /**
  * @brief Check server_prompt_tree save and restore against a cold prefill (kinds check_tree_*).
  *
@@ -460,6 +501,7 @@ static void check_tree_case(bench_ctx & bc, server_prompt_tree & tree, const std
  * - split:  all of prompt 1, whose node was split by prompt 2
  * - inside: the first p - 1 tokens, whose last block belongs to a child
  * - keep:   all of prompt 2 into a sequence that holds prompt 1, keeping its first block
+ * Then check_attach() runs on the same prompts and references.
  */
 static bool check_tree(bench_ctx & bc, const std::vector<llama_token> & tokens, int32_t b) {
     const int32_t n1 = 4 * b;
@@ -511,7 +553,8 @@ static bool check_tree(bench_ctx & bc, const std::vector<llama_token> & tokens, 
         return false;
     }
     check_tree_case(bc, tree, prompt2, n2, b, ref2, "check_tree_keep", b);
-    return true;
+
+    return check_attach(bc, prompt1, n1, prompt2, n2, b, ref1, ref2);
 }
 
 int main(int argc, char ** argv) {
@@ -553,7 +596,7 @@ int main(int argc, char ** argv) {
     cparams.n_ctx           = args.n_ctx;
     cparams.n_batch         = std::max(n_max, args.n_prefix);
     cparams.n_ubatch        = args.n_ubatch;
-    cparams.n_seq_max       = 2;
+    cparams.n_seq_max       = 3;
     cparams.kv_unified      = true;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     if (args.n_threads > 0) {
